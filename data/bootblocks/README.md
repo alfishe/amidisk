@@ -32,10 +32,14 @@ To calculate and inject the correct checksum:
    # Example Python implementation
    acc = 0
    for i in range(256):
+       if i == 1:
+           continue # Skip the checksum field itself (offset 4)
+           
        acc += struct.unpack_from(">I", bootblock_data, i * 4)[0]
        if acc > 0xFFFFFFFF:
            acc = (acc & 0xFFFFFFFF) + 1
    ```
 4. **Finalize**: The final checksum to be stored at offset `0x04` is the bitwise NOT (inversion) of the accumulated sum (`~acc & 0xFFFFFFFF`).
 
-When the Amiga ROM calculates this same sum over the final bootblock at startup, the resulting value will equal exactly `0xFFFFFFFF`. If it doesn't, the ROM will reject the bootblock and refuse to boot!
+### The Proper Range
+The range of bytes controlled by the checksum is **exactly the first 1024 bytes** (offset `0` to `1023`) of the partition. Because the checksum is stored *inside* this block at offset `4`, you must either temporarily zero out offset `4` before summing the 1024 bytes, or explicitly skip the second longword (`i == 1`) during your calculation loop. When the Amiga ROM later verifies the bootblock, it simply sums the entire 1024 bytes (including your injected checksum field); the additive wraparound of `sum + ~sum` guarantees the result equals exactly `0xFFFFFFFF`.
