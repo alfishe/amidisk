@@ -10,9 +10,13 @@ This directory contains reference standard Amiga bootblocks that can be injected
 | `std_boot_2x3x.bin` | Standard AmigaOS 2.x/3.x Bootcode | The default bootcode used by standard `Install` commands from OS 2.0 through 3.2. This is the recommended bootcode for modern RDB setups using FFS, SFS, or PFS3. |
 
 ## Bootblock Anatomy
-For a bootblock to be recognized by the Amiga ROM, it must be exactly 1024 bytes and contain:
-1. **Signature**: `DOS\x` identifier at byte `0`.
-2. **Checksum**: A 32-bit checksum at byte `4` covering the entire 1024 bytes.
-3. **Executable Code**: Motorola 68000 machine code.
+For a bootblock to be recognized by the Amiga ROM, it must be exactly 1024 bytes and follow this exact layout:
 
-*(Note: The provided `.bin` files contain the standard Amiga `DOS\0` signature and a pre-calculated checksum. When injecting these into a live filesystem like `DOS\3` or `PFS\3`, the signature must be overwritten with the filesystem's specific identifier, and the 32-bit checksum must be dynamically recalculated!)*
+| Offset | Size | Field | Description |
+| :--- | :--- | :--- | :--- |
+| `0x00` (0) | 4 bytes | `Signature` | Identifies the filesystem (`DOS\0`, `DOS\1`, `DOS\3`, `SFS\0`, etc). |
+| `0x04` (4) | 4 bytes | `Checksum` | Calculated so the 32-bit sum of the entire 1024 bytes equals `0xFFFFFFFF`. |
+| `0x08` (8) | 4 bytes | `Root Block` | Pointer to the root block of the partition (used primarily by legacy FFS/OFS bootcodes). |
+| `0x0C` (12)| 1012 bytes| `Boot Code` | The executable Motorola 68000 machine code. |
+
+*(Note: The `.bin` files provided in this catalog **only contain the raw Boot Code payload** (starting at offset 12), not the full 1024 bytes. When injecting these into a partition, you must dynamically write the Signature at `0`, reserve `4` and `8`, append the `.bin` payload at `12`, pad the rest of the 1024 bytes with `\x00`, and then finally calculate and inject the Checksum at `4`!)*
