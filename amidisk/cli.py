@@ -371,6 +371,7 @@ DOS_TYPES = {  # accepted --dostype spellings
     "ffs": 0x444F5301, "dos1": 0x444F5301,
     "ofs-intl": 0x444F5302, "dos2": 0x444F5302,
     "ffs-intl": 0x444F5303, "dos3": 0x444F5303,
+    "sfs": 0x53465300, "sfs0": 0x53465300,
 }
 
 
@@ -409,18 +410,28 @@ def cmd_create(args):
 
 
 def cmd_format(args):
-    dt = args.dostype or "ffs-intl"
-    dos_type = DOS_TYPES.get(dt.lower())
-    if dos_type is None:
-        try:
-            dos_type = int(dt, 0)
-        except ValueError:
-            print("error: unknown dostype %r (use: %s)"
-                  % (dt, ", ".join(sorted(DOS_TYPES))), file=sys.stderr)
-            return 1
     with open_image(args.image, writable=True) as img:
         vol_ref = img.get_volume(getattr(args, "volume", None))
-        vol = vol_ref.raw_volume()
+        
+        dos_type = None
+        if getattr(args, "dostype", None):
+            dt = args.dostype
+            dos_type = DOS_TYPES.get(dt.lower())
+            if dos_type is None:
+                try:
+                    dos_type = int(dt, 0)
+                except ValueError:
+                    print("error: unknown dostype %r (use: %s)"
+                          % (dt, ", ".join(sorted(DOS_TYPES))), file=sys.stderr)
+                    return 1
+        else:
+            if vol_ref.partition is not None:
+                dos_type = vol_ref.partition.dos_env.dos_type
+            else:
+                dos_type = DOS_TYPES["ffs-intl"]
+
+        from .image import engine_for_dostype
+        vol = vol_ref.raw_volume(engine_for_dostype(dos_type))
         vol.format(args.label.encode("latin-1"), dos_type=dos_type)
         info = vol.open().get_info()
         print("formatted %s as %r (%s, %s free)" % (
