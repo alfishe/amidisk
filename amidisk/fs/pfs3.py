@@ -118,6 +118,7 @@ class PFS3Volume:
         self.dos_type = dos_type
         self.read_only = True
         self.label = None
+        self.max_name_len = 107
         self._anode_cache = {}
         self._index_cache = {}
 
@@ -229,9 +230,9 @@ class PFS3Volume:
                 raise FSError("bad PFS3 superblock id")
             blocknr = struct.unpack_from(">i", sraw, 12 + soff * 4)[0]
         else:
-            if nr >= len(self.small_indexblocks):
+            if nr >= 99:
                 raise FSError("PFS3 index block %d out of range" % nr)
-            blocknr = self.small_indexblocks[nr]
+            blocknr = struct.unpack_from(">I", self.root_raw, 116 + nr * 4)[0]
         if not blocknr:
             raise FSError("PFS3 index block %d is zero" % nr)
         raw = self._read_reserved(blocknr)
@@ -244,6 +245,13 @@ class PFS3Volume:
         """anodenr -> (clustersize, blocknr, next)."""
         if anodenr in self._anode_cache:
             return self._anode_cache[anodenr]
+        # during a write transaction, prefer the in-flight anode blocks
+        ab_cache = getattr(self, "_ab_cache", None)
+        if ab_cache and self.split_anodes:
+            s, off = anodenr >> 16, anodenr & 0xFFFF
+            if s in ab_cache:
+                _, araw = ab_cache[s]
+                return struct.unpack_from(">3I", araw, 16 + off * 12)
         if self.split_anodes:
             seqnr, offset = anodenr >> 16, anodenr & 0xFFFF
         else:
@@ -545,6 +553,11 @@ class PFS3Volume:
     def _alloc_main(self, count):
         """Allocate `count` blocks from the main area; returns runs
         [(start, len)] (contiguous where possible)."""
+        if count > self.blocksfree:
+            raise FSError(
+                "PFS3 volume full: needed %d blocks, %d free"
+                % (count, self.blocksfree)
+            )
         total = self.disksize or self.total
         start = self._bitmapstart()
         runs = []
@@ -564,6 +577,16 @@ class PFS3Volume:
                 continue
             if wrapped and blk >= (self._roving if start <= self._roving < total else start):
                 break
+            # skip fully-allocated 32-block words at word-compare speed
+            if (blk - start) % 32 == 0 and blk + 32 <= total:
+                seq, off, _ = self._main_bit(blk)
+                _, praw = self._get_bmb(seq)
+                if struct.unpack_from(">I", praw, 12 + off * 4)[0] == 0:
+                    if run_n:
+                        runs.append((run_s, run_n))
+                        run_n = 0
+                    blk += 32
+                    continue
             if self._block_is_free(blk):
                 if run_n and run_s + run_n == blk:
                     run_n += 1
@@ -668,26 +691,33 @@ class PFS3Volume:
         self._ab_dirty.add(seqnr)
         self._anode_cache.pop(anodenr, None)
 
+    def _try_alloc_anode_in(self, s):
+        ablk, araw = self._anode_block(s, create=False)
+        if araw is None:
+            ablk, araw = self._anode_block(s, create=True)
+        for k in range(self.anodes_per_block):
+            if s == 0 and k <= ANODE_ROOTDIR:
+                continue  # never hand out the reserved anodes
+            cs, bn, nxt = struct.unpack_from(">3I", araw, 16 + k * 12)
+            if bn == 0 and cs == 0 and nxt == 0:
+                anodenr = (s << 16) | k
+                self._save_anode(anodenr, 0, 0xFFFFFFFF, 0)
+                return anodenr
+        return None
+
     def _alloc_anode(self, hint_seqnr=0):
         """Find a free anode slot (blocknr == 0); returns anodenr."""
-        seqnrs = [hint_seqnr] if hint_seqnr else []
-        seqnr = 0
-        while True:
-            if seqnr not in seqnrs:
-                seqnrs.append(seqnr)
-            ablk, araw = self._anode_block(seqnrs[-1], create=False)
-            if araw is None:
-                # no more blocks: create a fresh one at this seqnr
-                ablk, araw = self._anode_block(seqnr, create=True)
-            for k in range(self.anodes_per_block):
-                if seqnrs[-1] == 0 and k <= ANODE_ROOTDIR:
-                    continue  # never hand out the reserved anodes
-                cs, bn, nxt = struct.unpack_from(">3I", araw, 16 + k * 12)
-                if bn == 0 and cs == 0 and nxt == 0:
-                    anodenr = (seqnrs[-1] << 16) | k
-                    self._save_anode(anodenr, 0, 0xFFFFFFFF, 0)
-                    return anodenr
-            seqnr = seqnrs[-1] + 1
+        if hint_seqnr:
+            r = self._try_alloc_anode_in(hint_seqnr)
+            if r is not None:
+                return r
+        for seqnr in range(0x10000):
+            if seqnr == hint_seqnr and hint_seqnr:
+                continue
+            r = self._try_alloc_anode_in(seqnr)
+            if r is not None:
+                return r
+        raise FSError("PFS3 anode space exhausted")
 
     def _free_anode(self, anodenr):
         self._save_anode(anodenr, 0, 0, 0)
@@ -1192,6 +1222,7 @@ class PFS3Volume:
         self._anode_cache = {}
         self._index_cache = {}
         self.read_only = False
+        self.small_indexblocks = (0,) * 99
 
         # rootblock extension
         rext = bytearray(resblocksize)

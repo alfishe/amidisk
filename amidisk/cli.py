@@ -19,6 +19,20 @@ from .fs.util import str_to_protect
 from .blkdev import BlockDeviceError
 
 
+def print_progress(current_bytes, total_bytes, current_file=""):
+    """Prints a dynamic, overwriting progress bar to stdout."""
+    percent = (current_bytes / total_bytes) * 100 if total_bytes > 0 else 0
+    bar_len = 30
+    filled = int((percent / 100) * bar_len)
+    bar = '#' * filled + '-' * (bar_len - filled)
+    
+    # \x1b[2K clears the entire current line, \r returns cursor to the beginning
+    sys.stdout.write("\x1b[2K\r[%s] %5.1f%% (%s / %s) %s" % (
+        bar, percent, human_size(current_bytes), human_size(total_bytes), current_file[:40]
+    ))
+    sys.stdout.flush()
+
+
 def human_size(n):
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024 or unit == "TB":
@@ -28,11 +42,78 @@ def human_size(n):
 
 # ---------------------------------------------------------------- info
 def cmd_info(args):
-    with open_image(args.image) as img:
+    img_path = args.image
+    vol_name = ""
+    if ":" in img_path and not os.path.exists(img_path):
+        img_path, vol_name = img_path.split(":", 1)
+
+    with open_image(img_path) as img:
         info = img.get_info()
+        
+        # Detailed single partition info
+        if vol_name:
+            v = img.get_volume(vol_name)
+            if args.json:
+                print(json.dumps(v.part_blk.get_info() if hasattr(v, "part_blk") else {}, indent=2))
+                return 0
+            
+            print("\n[ RDB Partition Configuration ]")
+            print("  drive:      %s" % v.name)
+            if v.partition:
+                p = v.partition.get_info()
+                print("  dos type:   %s" % p.get("dos_type", "Unknown"))
+                print("  size:       %s (cylinders %d to %d)" % (
+                    human_size(p.get("size_bytes", 0)),
+                    p.get("low_cyl", 0),
+                    p.get("high_cyl", 0)
+                ))
+                boot_str = "Yes (Priority: %d)" % p.get("boot_pri", 0) if p.get("bootable") else "No"
+                print("  boot:       %s" % boot_str)
+                print("  blksize:    %d bytes" % p.get("block_size", 512))
+                print("  max trans:  0x%08X" % p.get("max_transfer", 0))
+                print("  mask:       0x%08X" % p.get("mask", 0))
+                print("  buffers:    %d" % p.get("num_buffer", 0))
+                
+            print("\n[ Filesystem Statistics ]")
+            try:
+                vol = v.mount()
+                vi = vol.get_info()
+                total_bytes = vi["total_blocks"] * vi["block_size"]
+                used_bytes = total_bytes - vi["free_bytes"]
+                print("  label:      %r" % vi["label"])
+                print("  used:       %s" % human_size(used_bytes))
+                print("  free:       %s" % human_size(vi["free_bytes"]))
+                
+                if p and "bb_chksum_match" in p:
+                    match = p["bb_chksum_match"]
+                    got = p["bb_got_chksum"]
+                    exp = p["bb_expected_chksum"]
+                    bb_id = p.get("bb_id", 0)
+                    from amidisk.rdb.blocks import dos_type_to_str
+                    id_str = dos_type_to_str(bb_id) if bb_id else "Unknown"
+                    if match:
+                        print("  bootblock:  Custom Executable (chksum OK: 0x%08X)" % got)
+                    else:
+                        if got == 0:
+                            print("  bootblock:  Standard (ID: %s, no custom bootcode)" % id_str)
+                        else:
+                            print("  bootblock:  INVALID CHECKSUM (ID: %s, got: 0x%08X, exp: 0x%08X)" % (id_str, got, exp))
+                
+                rep = vol.check(deep=False)
+                print("  files:      %d" % rep["files"])
+                print("  dirs:       %d" % rep["dirs"])
+                status = "OK" if rep["ok"] else "ERRORS"
+                print("  state:      %s" % status)
+            except (FSError, BlockDeviceError) as ex:
+                print("error: cannot mount %s: %s" % (v.name, ex))
+            return 0
+
+        # General image info
         if args.json:
             print(json.dumps(info, indent=2))
             return 0
+            
+        print("\n[ Global Image Info ]")
         print("image:  %s" % info["path"])
         print("kind:   %s  (%s)" % (info["kind"], human_size(info["size_bytes"])))
         if "rdb" in info:
@@ -44,46 +125,71 @@ def cmd_info(args):
                     r["cylinders"], r["heads"], r["sectors"], r["rdb_block"],
                 )
             )
-            print("partitions:")
+            print("\n[ RDB Partition Configuration ]")
             for p in info["partitions"]:
-                print(
-                    "  %d: %-8s %-7s cyl %6d-%6d  bs=%-5d %10s  boot=%s pri=%d"
-                    % (
-                        p["num"], p["drv_name"], p["dos_type"],
-                        p["low_cyl"], p["high_cyl"], p["block_size"],
-                        human_size(p["size_bytes"]), "yes" if p["bootable"] else "no ",
-                        p["boot_pri"],
-                    )
-                )
+                boot_str = "Yes (Priority: %d)" % p["boot_pri"] if p["bootable"] else "No"
+                print("  %-8s %-32s Size: %-10s Cyls: %d to %d" % (
+                    p["drv_name"] + ":", p["dos_type"], human_size(p["size_bytes"]), p["low_cyl"], p["high_cyl"]
+                ))
+                print("           Bootable: %-22s BlockSize: %-5d   Buffers: %d" % (
+                    boot_str, p["block_size"], p.get("num_buffer", 0)
+                ))
+                print("           MaxTransfer: 0x%08X        Mask: 0x%08X" % (
+                    p["max_transfer"], p["mask"]
+                ))
+                
                 if "bb_chksum_match" in p:
                     match = p["bb_chksum_match"]
                     got = p["bb_got_chksum"]
                     exp = p["bb_expected_chksum"]
+                    bb_id = p.get("bb_id", 0)
+                    
+                    from amidisk.rdb.blocks import dos_type_to_str
+                    id_str = dos_type_to_str(bb_id) if bb_id else "Unknown"
+                    
                     if match:
-                        print("      bootblock: OK (chksum: 0x%08X)" % got)
+                        print("           Bootblock: Custom Executable (chksum OK: 0x%08X)" % got)
                     else:
-                        print("      bootblock: INVALID (got: 0x%08X, expected: 0x%08X)" % (got, exp))
+                        if got == 0:
+                            print("           Bootblock: Standard (ID: %s, no custom bootcode)" % id_str)
+                        else:
+                            print("           Bootblock: INVALID CHECKSUM (ID: %s, got: 0x%08X, expected: 0x%08X)" % (id_str, got, exp))
+                print("") # separator between partitions
             if info["filesystems"]:
-                print("embedded filesystems:")
+                print("\n[ RDB Embedded Filesystems ]")
                 for f in info["filesystems"]:
                     print(
                         "  %d: %-7s v%-8s patch_flags=0x%x"
                         % (f["num"], f["dos_type"], f["version"], f["patch_flags"])
                     )
-        print("volumes:")
-        for v in img.volumes:
-            try:
-                vi = v.mount().get_info()
+        print("\n[ Filesystem Statistics ]")
+        # same data source as --json: the per-volume section of get_info()
+        for entry in info.get("volumes", []):
+            name = entry["name"]
+            if "volume" in entry:
+                vi = entry["volume"]
                 print(
                     "  %-8s %-16r %-7s %10s free of %s"
                     % (
-                        v.name + ":", vi["label"], vi["dos_type"],
+                        name + ":", vi["label"], vi["dos_type"],
                         human_size(vi["free_bytes"]),
                         human_size(vi["total_blocks"] * vi["block_size"]),
                     )
                 )
-            except (FSError, BlockDeviceError) as ex:
-                print("  %-8s <unmountable: %s>" % (v.name + ":", ex))
+            else:
+                print("  %-8s <unmountable: %s>" % (name + ":", entry.get("error", "?")))
+                ident = entry.get("identify")
+                if ident:
+                    print(
+                        "           declared type %s, %s, first block '%s'"
+                        % (
+                            ident["declared_dos_type"] or "unknown",
+                            human_size(ident["size_bytes"]),
+                            ident["boot_magic"],
+                        )
+                    )
+                    for g in ident["guesses"]:
+                        print("           detected: %s" % g)
     return 0
 
 
@@ -254,30 +360,88 @@ def cmd_cp(args):
     return 0
 
 
-# ---------------------------------------------------------------- put
+def truncate_name(name, max_len):
+    if len(name) <= max_len:
+        return name
+    base, ext = os.path.splitext(name)
+    if len(ext) >= max_len:
+        return name[:max_len]
+    allowed_base_len = max_len - len(ext) - 3
+    if allowed_base_len < 2:
+        return name[:max_len]
+    left = allowed_base_len // 2 + (allowed_base_len % 2)
+    right = allowed_base_len // 2
+    return base[:left] + "..." + base[-right:] + ext
+
+def _parse_scp_target(target):
+    """Splits 'image.hdf:DH0:path' into ('image.hdf', 'DH0:path') safely."""
+    for i in range(len(target)):
+        if target[i] == ":":
+            candidate = target[:i]
+            if os.path.exists(candidate):
+                return candidate, target[i+1:]
+    return None, None
+
 def cmd_put(args):
+    if args.dest is None:
+        img1, dest1 = _parse_scp_target(args.src)
+        img2, dest2 = _parse_scp_target(args.image)
+        
+        if img1 is not None:
+            # put src image:dest
+            real_src = args.image
+            args.image = img1
+            args.dest = dest1
+            args.src = real_src
+        elif img2 is not None:
+            # put image:dest src
+            args.image = img2
+            args.dest = dest2
+        else:
+            print("error: invalid syntax or image not found. Use 'put image src dest' or 'put src image:dest'", file=sys.stderr)
+            return 1
+
     with open_image(args.image, writable=True) as img:
         vol_ref, path = img.parse_path(args.dest)
         vol = vol_ref.mount()
         protect = str_to_protect(args.protect) if args.protect else 0
         comment = args.comment.encode("latin-1") if args.comment else b""
 
+        max_len = getattr(vol, "max_name_len", 30)
+
         src = args.src
+        
+        from .archives import get_handler
+        handler = get_handler(src)
+        if handler:
+            if not handler.test_archive():
+                return 1
+            base = path.rstrip("/")
+            try:
+                n, size = handler.stream_to_volume(
+                    vol, base, truncate_name, max_len, protect, comment
+                )
+                print("streamed %d files (%d bytes) from archive" % (n, size))
+                return 0
+            except Exception:
+                return 1
+
         if os.path.isfile(src):
+            basename = truncate_name(os.path.basename(src), max_len)
             if not path or path.endswith("/"):
-                path = (path or "") + os.path.basename(src)
+                path = (path or "") + basename
             else:
                 # writing onto an existing dir drops the file inside it
                 try:
                     if vol.resolve(path).is_dir():
-                        path = path.rstrip("/") + "/" + os.path.basename(src)
+                        path = path.rstrip("/") + "/" + basename
                 except FSError:
                     pass
             with open(src, "rb") as fh:
-                data = fh.read()
-            mtime = datetime.fromtimestamp(os.path.getmtime(src))
-            vol.write_file(path, data, protect=protect, comment=comment, mtime=mtime)
-            print("wrote %s (%d bytes)" % (path, len(data)))
+                mtime = datetime.fromtimestamp(os.path.getmtime(src))
+                size = os.path.getsize(src)
+                vol.write_file(path, fh, size=size, protect=protect, comment=comment, mtime=mtime)
+            print("wrote %s (%d bytes)" % (path, size))
             return 0
         if os.path.isdir(src):
             if not args.recursive:
@@ -285,21 +449,41 @@ def cmd_put(args):
                 return 1
             base = path.rstrip("/")
             n = 0
+            
+            # Pre-calculate total bytes for progress reporting
+            total_expected_bytes = 0
             for root, dirs, files in os.walk(src):
+                for f in files:
+                    total_expected_bytes += os.path.getsize(os.path.join(root, f))
+                    
+            total_bytes = 0
+            for root, dirs, files in os.walk(src):
+                dirs[:] = [d for d in dirs]
                 rel = os.path.relpath(root, src)
-                amiga_dir = base if rel == "." else (
-                    (base + "/" if base else "") + rel.replace(os.sep, "/")
+                if rel != ".":
+                    parts = [truncate_name(p, max_len) for p in rel.split(os.sep)]
+                    rel_amiga = "/".join(parts)
+                else:
+                    rel_amiga = "."
+
+                amiga_dir = base if rel_amiga == "." else (
+                    (base + "/" if base else "") + rel_amiga
                 )
                 if amiga_dir:
                     vol.makedirs(amiga_dir)
                 for f in files:
                     hostf = os.path.join(root, f)
-                    apath = (amiga_dir + "/" if amiga_dir else "") + f
+                    truncated_f = truncate_name(f, max_len)
+                    apath = (amiga_dir + "/" if amiga_dir else "") + truncated_f
                     with open(hostf, "rb") as fh:
-                        data = fh.read()
-                    mtime = datetime.fromtimestamp(os.path.getmtime(hostf))
-                    vol.write_file(apath, data, mtime=mtime)
+                        mtime = datetime.fromtimestamp(os.path.getmtime(hostf))
+                        size = os.path.getsize(hostf)
+                        vol.write_file(apath, fh, size=size, protect=protect, comment=comment, mtime=mtime)
                     n += 1
+                    total_bytes += size
+                    print_progress(total_bytes, total_expected_bytes, truncated_f)
+            
+            print("") # lock progress bar
             print("wrote %d files under %s" % (n, base or "root"))
             return 0
         print("error: no such file: %s" % src, file=sys.stderr)
@@ -379,8 +563,19 @@ DOS_TYPES = {  # accepted --dostype spellings
     "ffs": 0x444F5301, "dos1": 0x444F5301,
     "ofs-intl": 0x444F5302, "dos2": 0x444F5302,
     "ffs-intl": 0x444F5303, "dos3": 0x444F5303,
+    "ofs-dc": 0x444F5304, "dos4": 0x444F5304,
+    "ffs-dc": 0x444F5305, "dos5": 0x444F5305,
+    "ofs-intl-lnfs": 0x444F5306, "dos6": 0x444F5306,
+    "ffs-intl-lnfs": 0x444F5307, "dos7": 0x444F5307,
     "sfs": 0x53465300, "sfs0": 0x53465300,
-    "pfs3": 0x50465303,
+    "sfs2": 0x53465302,
+    "pfs0": 0x50465300,
+    "pfs1": 0x50465301,
+    "pfs2": 0x50465302,
+    "pfs3": 0x50465303, "pds3": 0x50445303,
+    "pfs3-modern": 0x50465333,
+    "jxfs": 0x4a584604,
+    "swap": 0x53574150,
 }
 
 
@@ -410,11 +605,99 @@ def cmd_create(args):
     with open(args.image, "wb") as fh:
         fh.truncate(size)  # sparse where the host filesystem supports it
     print("created %s (%s)" % (args.image, human_size(size)))
+    
+    if getattr(args, "layout", None):
+        layout_str = args.layout
+        if layout_str.lower() == "default":
+            layout_str = "DH0:*:ffs-intl:Empty:boot"
+            
+        from .rdb import RDisk
+        from .blkdev import open_blkdev
+        
+        # 1. Initialize RDB
+        dev = open_blkdev(args.image, read_only=False)
+        rd = RDisk.create(dev)
+        i = rd.get_info()
+        print("initialized RDB: %s partitionable" % human_size((i["hi_cylinder"] - i["lo_cylinder"] + 1) * i["cyl_blocks"] * i["block_bytes"]))
+        dev.close()
+        
+        # 2. Add partitions
+        parts = layout_str.split(",")
+        for p in parts:
+            if not p.strip(): continue
+            fields = p.split(":")
+            
+            name = fields[0]
+            size_str = fields[1] if len(fields) > 1 else "*"
+            dostype_str = fields[2] if len(fields) > 2 else "ffs-intl"
+            label = fields[3] if len(fields) > 3 else None
+            bootable = False
+            
+            if len(fields) > 4 and fields[4].lower() == "boot":
+                bootable = True
+            elif label and label.lower() == "boot":
+                bootable = True
+                label = None
+                
+            if label == "":
+                label = None
+                
+            size_bytes = None
+            if size_str != "*" and size_str.lower() != "auto":
+                size_bytes = parse_size(size_str)
+                
+            # Add partition via cmd_part_add logic natively
+            with open_image(args.image, writable=True) as img:
+                dos_type = _parse_dostype(dostype_str)
+                part = img.rdisk.add_partition(
+                    name,
+                    size_bytes=size_bytes,
+                    dos_type=dos_type,
+                    sec_per_blk=1,
+                    bootable=bootable,
+                    boot_pri=0,
+                )
+                pi = part.get_info()
+                print("added %s: %s, %s" % (pi["drv_name"], human_size(pi["size_bytes"]), pi["dos_type"]))
+            
+            # Format partition if requested
+            if label:
+                f_args = argparse.Namespace(
+                    image=args.image, volume=name, label=label, dostype=None
+                )
+                cmd_format(f_args)
+        return 0
+
     if args.format:
         args.volume = None
         args.label = args.format
         args.dostype = args.dostype or ("ofs" if args.adf else "ffs-intl")
         return cmd_format(args)
+    return 0
+
+
+def cmd_bootblock(args):
+    with open_image(args.image, writable=True) as img:
+        vol_ref = img.get_volume(getattr(args, "volume", None))
+        
+        with open(args.bootcode, "rb") as f:
+            bootcode = f.read()
+            
+        vol = vol_ref.raw_volume()
+            
+        # Standard Amiga bootblock is 2 blocks (1024 bytes for 512b sectors)
+        bb_size = vol.dev.block_bytes * 2
+        if len(bootcode) > bb_size:
+            print("error: bootcode is too large (%d > %d bytes)" % (len(bootcode), bb_size), file=sys.stderr)
+            return 1
+            
+        # Pad with zeros
+        padded = bootcode.ljust(bb_size, b'\x00')
+        
+        # Check if the partition already has a DOS type, if the bootcode lacks DOS\x we might warn.
+        vol.dev.write(0, padded)
+        
+        print("installed bootblock (%d bytes) to %s" % (len(bootcode), vol_ref.name))
     return 0
 
 
@@ -511,6 +794,29 @@ def cmd_part_add(args):
                 human_size(i["size_bytes"]), i["dos_type"], i["block_size"],
             )
         )
+        # a dostype the ROM cannot serve needs its handler embedded in the
+        # RDB; pull one from the driver collection automatically
+        if (dos_type >> 8) != 0x444F53 and not getattr(args, "no_auto_fs", False):
+            have = any(f.fshd_blk.dos_type == dos_type
+                       for f in img.rdisk.get_filesystems())
+            if not have:
+                found = _collection_lookup(dos_type)
+                if found:
+                    dpath, ver, dname = found
+                    with open(dpath, "rb") as fh:
+                        ddata = fh.read()
+                    try:
+                        fs = _embed_driver(img.rdisk, ddata, dos_type, ver)
+                        print("embedded %s driver %s v%s from collection"
+                              % (fs.get_dos_type_str(), dname,
+                                 fs.get_version_string()))
+                    except Exception as ex:
+                        print("warning: could not embed driver: %s" % ex,
+                              file=sys.stderr)
+                else:
+                    print("note: no %s driver in the RDB or collection -- the "
+                          "partition will not boot on a real machine "
+                          "(use fs-add)" % i["dos_type"])
         if args.format:
             args.volume = args.name
             args.label = args.format
@@ -792,6 +1098,79 @@ def cmd_repair(args):
     return rc
 
 
+# ---------------------------------------------------------------- fs-add
+def _driver_collection():
+    """Locate the driver collection (manifest.json + hunk binaries)."""
+    for cand in (os.environ.get("AMIDISK_DRIVERS"),
+                 os.path.join("data", "drivers")):
+        if cand and os.path.isfile(os.path.join(cand, "manifest.json")):
+            return cand
+    return None
+
+
+def _collection_lookup(dos_type):
+    """Find a driver for dos_type in the collection; returns
+    (path, version_tuple, name) or None."""
+    coll = _driver_collection()
+    if not coll:
+        return None
+    with open(os.path.join(coll, "manifest.json")) as fh:
+        manifest = json.load(fh)
+    for d in manifest.get("drivers", []):
+        if any(int(t, 0) == dos_type for t in d.get("dostypes", [])):
+            ver = tuple(int(x) for x in d.get("version", "0.0").split("."))[:2]
+            return os.path.join(coll, d["file"]), ver, d.get("name", d["file"])
+    return None
+
+
+def _parse_hunk_version(data):
+    """Extract (version, revision) from a $VER: string, if present."""
+    import re
+
+    i = data.find(b"$VER:")
+    if i < 0:
+        return None
+    m = re.search(rb"(\d+)\.(\d+)", data[i : i + 128])
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _embed_driver(rdisk, data, dos_type, version=None, patch_flags=0x180):
+    if data[0:4] != b"\x00\x00\x03\xf3":
+        raise FSError("not an Amiga hunk executable (missing 0x3F3 magic)")
+    ver = version or _parse_hunk_version(data) or (0, 0)
+    fs = rdisk.add_filesystem(data, dos_type, version=ver,
+                              patch_flags=patch_flags)
+    return fs
+
+
+def cmd_fs_add(args):
+    from .rdb.rdisk import RDiskError
+
+    with open_image(args.image, writable=True) as img:
+        if not img.rdisk:
+            print("error: image has no RDB (run rdb-init first)", file=sys.stderr)
+            return 1
+        dos_type = _parse_dostype(args.dostype, default=None)
+        if dos_type is None:
+            print("error: --dostype is required", file=sys.stderr)
+            return 1
+        with open(args.driver, "rb") as fh:
+            data = fh.read()
+        version = None
+        if args.version:
+            version = tuple(int(x) for x in args.version.split("."))[:2]
+        try:
+            fs = _embed_driver(img.rdisk, data, dos_type, version,
+                               int(args.patch_flags, 0))
+        except (RDiskError, FSError) as ex:
+            print("error: %s" % ex, file=sys.stderr)
+            return 1
+        print("embedded %s v%s (%d bytes, %d LSEG blocks)" % (
+            fs.get_dos_type_str(), fs.get_version_string(), len(data),
+            (len(data) + 491) // 492))
+    return 0
+
+
 # ---------------------------------------------------------------- fs-extract
 def cmd_fs_extract(args):
     with open_image(args.image) as img:
@@ -895,7 +1274,7 @@ def main(argv=None):
     p = sub.add_parser("put", help="copy a host file/dir into the image")
     p.add_argument("image")
     p.add_argument("src")
-    p.add_argument("dest")
+    p.add_argument("dest", nargs="?", help="optional if SCP-style syntax used")
     p.add_argument("-r", "--recursive", action="store_true")
     p.add_argument("--comment")
     p.add_argument("--protect", help="e.g. 'hsparwed' subset like '----rwed'")
@@ -938,7 +1317,7 @@ def main(argv=None):
     p.add_argument("image")
     p.add_argument("--sectors", type=int, default=63)
     p.add_argument("--heads", type=int)
-    p.add_argument("--rdb-cyls", type=int, default=2)
+    p.add_argument("--rdb-cyls", type=int, default=None)
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_rdb_init)
 
@@ -951,7 +1330,20 @@ def main(argv=None):
     p.add_argument("--bootable", action="store_true")
     p.add_argument("--pri", type=int, default=0, help="boot priority")
     p.add_argument("--format", metavar="LABEL", help="format the new partition")
+    p.add_argument("--no-auto-fs", action="store_true",
+                   help="do not auto-embed a driver from the collection")
     p.set_defaults(func=cmd_part_add)
+
+    p = sub.add_parser(
+        "fs-add",
+        help="embed a filesystem driver (hunk binary) into the RDB (FSHD+LSEG)",
+    )
+    p.add_argument("image")
+    p.add_argument("driver", help="path to the driver, e.g. pfs3aio")
+    p.add_argument("--dostype", required=True, help="pfs3|sfs|... or hex")
+    p.add_argument("--version", help="M.R override (default: parse $VER)")
+    p.add_argument("--patch-flags", default="0x180")
+    p.set_defaults(func=cmd_fs_add)
 
     p = sub.add_parser("part-del", help="remove a partition from the RDB (simulates first)")
     p.add_argument("image")
@@ -965,8 +1357,15 @@ def main(argv=None):
     p.add_argument("--adf", action="store_true", help="880K floppy image")
     p.add_argument("--format", metavar="LABEL", help="format after creating")
     p.add_argument("--dostype", help="ofs|ffs|ofs-intl|ffs-intl or hex")
+    p.add_argument("--layout", help="Init RDB (e.g. DH0:*:ffs:System:boot) or 'default'")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_create)
+
+    p = sub.add_parser("bootblock", help="install a custom bootblock to a partition")
+    p.add_argument("image", help="e.g. disk.hdf:DH0")
+    p.add_argument("bootcode", help="path to bootblock binary")
+    p.add_argument("--volume", help="partition to install to (drive name/index)")
+    p.set_defaults(func=cmd_bootblock)
 
     p = sub.add_parser("format", help="format a volume (OFS/FFS)")
     p.add_argument("image")

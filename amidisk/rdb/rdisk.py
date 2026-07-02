@@ -85,6 +85,7 @@ class Partition:
             "no_mount": self.part_blk.no_mount(),
             "max_transfer": e.max_transfer,
             "mask": e.mask,
+            "num_buffer": e.num_buffer,
         }
         
         # Verify bootblock checksum
@@ -108,6 +109,7 @@ class Partition:
                 info["bb_chksum_match"] = (got_chksum == expected_chksum)
                 info["bb_got_chksum"] = got_chksum
                 info["bb_expected_chksum"] = expected_chksum
+                info["bb_id"] = struct.unpack_from(">I", bb, 0)[0]
         except Exception:
             pass
             
@@ -226,7 +228,7 @@ class RDisk:
     # RDB creation / partition CRUD (rdbtool semantics)
     # ------------------------------------------------------------------
     @classmethod
-    def create(cls, blkdev, sectors=63, heads=None, rdb_cyls=2):
+    def create(cls, blkdev, sectors=63, heads=None, rdb_cyls=None):
         """Initialize a fresh RDB on the device (destroys existing table)."""
         if blkdev.read_only:
             raise RDiskError("device is read-only")
@@ -237,6 +239,11 @@ class RDisk:
                     break
         cyl_blocks = heads * sectors
         cyls = blkdev.num_blocks // cyl_blocks
+        if rdb_cyls is None:
+            # reserve room for embedded filesystem drivers (FSHD/LSEG):
+            # ~512 sectors (256 KB) unless the image is tiny, min 2 cyls
+            want_secs = min(512, max(64, blkdev.num_blocks // 20))
+            rdb_cyls = max(2, -(-want_secs // cyl_blocks))
         if cyls <= rdb_cyls:
             raise RDiskError("image too small for an RDB")
         rdb = RDBlock.new(blkdev, 0)
@@ -410,6 +417,73 @@ class RDisk:
         self._write_rdb()
         self._read_partitions()
         return self.find_partition_by_drive_name(drv_name)
+
+    def add_filesystem(self, data, dos_type, version=(0, 0), patch_flags=0x180):
+        """Embed a filesystem driver (Amiga hunk executable) as an
+        FSHD + LSEG chain -- the mechanism the ROM boot strap uses to load
+        handlers for dostypes it does not know (PFS3, SFS, ...)."""
+        if self.rdb is None:
+            raise RDiskError("no RDB open")
+        for f in self.fs:
+            if f.fshd_blk.dos_type == dos_type:
+                raise RDiskError(
+                    "filesystem for %s already embedded (v%s)"
+                    % (f.get_dos_type_str(), f.get_version_string())
+                )
+        bb = self.blkdev.block_bytes
+        per = bb - 20  # LSEG payload bytes per block
+        nseg = (len(data) + per - 1) // per
+        used = self._used_rdb_blocks()
+        hi = min(self.rdb.rdb_blocks_hi, self.blkdev.num_blocks - 1)
+        free = [b for b in range(self.rdb.rdb_blocks_lo, hi + 1) if b not in used]
+        if len(free) < nseg + 1:
+            raise RDiskError(
+                "RDB area too small: need %d blocks for the driver, %d free "
+                "(re-init with more reserved space: rdb-init --rdb-cyls N)"
+                % (nseg + 1, len(free))
+            )
+        fshd_blk_num = free[0]
+        seg_blks = free[1 : 1 + nseg]
+        for i, blk in enumerate(seg_blks):
+            chunk = data[i * per : (i + 1) * per]
+            if len(chunk) % 4:
+                chunk = chunk + b"\x00" * (4 - len(chunk) % 4)
+            lseg = LoadSegBlock.new(self.blkdev, blk,
+                                    size_longs=5 + len(chunk) // 4)
+            lseg.host_id = self.rdb.host_id
+            lseg.next = seg_blks[i + 1] if i + 1 < nseg else END
+            lseg.load_data = chunk
+            lseg.write()
+        fshd = FSHeaderBlock.new(self.blkdev, fshd_blk_num)
+        fshd.host_id = self.rdb.host_id
+        fshd.next = END
+        fshd.flags = 0
+        fshd.dos_type = dos_type
+        fshd.version = (version[0] << 16) | version[1]
+        fshd.patch_flags = patch_flags
+        fshd.dn_type = 0
+        fshd.dn_task = 0
+        fshd.dn_lock = 0
+        fshd.dn_handler = 0
+        fshd.dn_stack_size = 0
+        fshd.dn_priority = 0
+        fshd.dn_startup = 0
+        fshd.dn_seg_list_blk = seg_blks[0] if seg_blks else END
+        fshd.dn_global_vec = 0xFFFFFFFF  # -1, per patch_flags bit 8
+        fshd.write()
+        # append to the FSHD chain
+        if self.rdb.fs_header_list in (0, END):
+            self.rdb.fs_header_list = fshd_blk_num
+        else:
+            last = self.fs[-1].fshd_blk
+            last.next = fshd_blk_num
+            last.write()
+        top = max([fshd_blk_num] + seg_blks)
+        if top > self.rdb.high_rdsk_block:
+            self.rdb.high_rdsk_block = top
+        self._write_rdb()
+        self._read_filesystems()
+        return self.fs[-1]
 
     def delete_partition(self, drv_name):
         part = self.find_partition_by_drive_name(drv_name)

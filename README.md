@@ -22,13 +22,31 @@ command (or run `python3 -m amidisk.cli`).
 | MBR-wrapped RDB (PiStorm/Emu68) | ✔ | – | auto-detected |
 | OFS/FFS DOS\0–\3 | ✔ | ✔ | incl. international mode, any block size 512–32K |
 | FFS DOS\4/\5 (dircache) | ✔ | ✔ | dircache chains maintained and verified |
-| FFS DOS\6/\7 (long filenames) | – | – | mount refused |
-| PFS3 (PFS\3, PDS\3, AFS\1) | ✔ | – | native reader; write belongs to the emulated handler (future) |
-| SFS (SFS\0) | ✔ | – | native reader |
+| FFS DOS\6/\7 (long filenames) | ✔ | ✔ | LNFS: 107-char names, overflow comment blocks |
+| PFS3 (PFS\3, PDS\3, AFS\1) | ✔ | ✔ | native read/write/format, ported from pfs3aio |
+| SFS (SFS\0) | ✔ | ✔ | native read/write/format, ported from AROS SFS / asfs |
+
+All engines support **streaming**: `read_file()` yields chunks and
+`write_file(path, source, size=...)` accepts bytes, file-likes, or chunk
+iterators, so image-to-image copies (`amidisk cp`) never buffer whole
+files or touch temp files.
 
 Validated against: volumes written by AmigaOS 3.2.3 itself (the sample
 images), amitools/xdftool (differential, both directions), hst-imager's
-PFS3, and real pfs3aio/SmartFilesystem-written fixtures in `data/test/`.
+independent C# PFS3 implementation (reads our writes and formats
+bit-perfect, and writes onto our volumes), and real pfs3aio /
+SmartFilesystem handler-written fixtures in `data/test/` — including
+strict handler-visibility checks for SFS (objectnode registration,
+hashtable chains, hash16 values verified against the real handler's
+output). PFS3/SFS mutation batteries assert zero space leak and that
+untouched files stay bit-identical. Caveat: SFS has no second local
+implementation to differential-test against (hst-imager lacks SFS), so
+the final oracle for SFS writes remains a mount under the real handler.
+
+Test suites: `python3 tests/smoke.py`, plus
+`python3 -m unittest discover -s tests -t .` (PFS3 unit tests in
+`tests/pfs3/`, SFS in `tests/sfs/`; hst-imager interop tests skip unless
+`HST_IMAGER` points at the binary).
 
 ## CLI
 
@@ -46,6 +64,8 @@ amidisk rm IMAGE VOL:path [-r]
 amidisk mv IMAGE VOL:old VOL:new
 amidisk check IMAGE [VOL] [--deep]           # per-filesystem validation
 amidisk fs-extract IMAGE                     # dump embedded FSHD/LSEG drivers
+amidisk fs-add IMAGE DRIVER --dostype pfs3   # embed a bootable m68k driver
+                                             # (auto on part-add from data/drivers/)
 
 amidisk create IMAGE --size 500M [--adf] [--format LABEL] [--dostype ffs-intl]
 amidisk format IMAGE LABEL [--volume DH0] [--dostype ofs|ffs|...|0x444F5303]

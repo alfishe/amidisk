@@ -14,6 +14,7 @@ class MemoryBlkDev(BlockDevice):
         super().__init__()
         self.block_bytes = block_bytes
         self.num_blocks = num_blocks
+        self.read_only = False
         self.data = bytearray(block_bytes * num_blocks)
 
     def read(self, lba, count=1):

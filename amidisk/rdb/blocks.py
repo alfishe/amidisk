@@ -252,11 +252,45 @@ class DosEnvec:
 
 
 def dos_type_to_str(dt):
-    tag = struct.pack(">I", dt)
-    txt = ""
-    for b in tag[:3]:
-        txt += chr(b) if 32 <= b < 127 else "?"
-    return "%s\\%X" % (txt, tag[3])
+    KNOWN_TYPES = {
+        0x444f5300: "DOS\\0 (OFS Non-intl)",
+        0x444f5301: "DOS\\1 (FFS Non-intl)",
+        0x444f5302: "DOS\\2 (OFS-Intl)",
+        0x444f5303: "DOS\\3 (FFS-Intl)",
+        0x444f5304: "DOS\\4 (OFS-DirCache)",
+        0x444f5305: "DOS\\5 (FFS-DirCache)",
+        0x444f5306: "DOS\\6 (OFS-LNFS)",
+        0x444f5307: "DOS\\7 (FFS-LNFS)",
+        0x53465300: "SFS\\0 (Smart File System v1)",
+        0x53465302: "SFS\\2 (Smart File System v2)",
+        0x50465300: "PFS\\0 (PFS/PFS2 Floppy/Basic)",
+        0x50465301: "PFS\\1 (PFS Hard disk)",
+        0x50465302: "PFS\\2 (PFS3 Legacy)",
+        0x50465303: "PFS\\3 (PFS3)",
+        0x50465333: "PFS3 (PFS3 Modern Standard)",
+        0x4a584604: "JXF\\4 (JXFS AmigaOS 4/MorphOS)",
+        0x53574150: "SWAP (Amiga Virtual/Swap)",
+        # Alien Filesystems for informational purposes
+        0x4d414300: "MAC\\0 (Mac OS)",
+        0x4c4e5800: "LNX\\0 (Linux native)",
+        0x53575000: "SWP\\0 (Linux swap)",
+        0x46415400: "FAT\\0 (FAT12/16)",
+        0x46415401: "FAT\\1 (FAT32)",
+        0x4e544653: "NTFS (Windows NTFS)",
+        0x65784654: "exFT (exFAT)",
+        0x45585434: "EXT4 (Linux EXT4)",
+    }
+    if dt in KNOWN_TYPES:
+        return KNOWN_TYPES[dt]
+        
+    try:
+        tag = struct.pack(">I", dt)
+        txt = ""
+        for b in tag[:3]:
+            txt += chr(b) if 32 <= b < 127 else "?"
+        return "%s\\%X" % (txt, tag[3])
+    except Exception:
+        return "0x%08X" % dt
 
 
 class PartitionBlock(RDBBaseBlock):
@@ -319,6 +353,23 @@ class FSHeaderBlock(RDBBaseBlock):
     def dos_type_str(self):
         return dos_type_to_str(self.dos_type)
 
+    def _pack(self):
+        self._put_long(3, self.host_id)
+        self._put_long(4, self.next)
+        self._put_long(5, self.flags)
+        self._put_long(8, self.dos_type)
+        self._put_long(9, self.version)
+        self._put_long(10, self.patch_flags)
+        self._put_long(11, self.dn_type)
+        self._put_long(12, self.dn_task)
+        self._put_long(13, self.dn_lock)
+        self._put_long(14, self.dn_handler)
+        self._put_long(15, self.dn_stack_size)
+        self._put_long(16, self.dn_priority)
+        self._put_long(17, self.dn_startup)
+        self._put_long(18, self.dn_seg_list_blk)
+        self._put_long(19, self.dn_global_vec)
+
 
 class LoadSegBlock(RDBBaseBlock):
     """LSEG -- chained chunks of a filesystem driver binary (hunk data)."""
@@ -329,6 +380,11 @@ class LoadSegBlock(RDBBaseBlock):
         self.host_id = self._long(3)
         self.next = self._long(4)
         self.load_data = self._bytes(20, (self.size_longs - 5) * 4)
+
+    def _pack(self):
+        self._put_long(3, self.host_id)
+        self._put_long(4, self.next)
+        self.data[20 : 20 + len(self.load_data)] = self.load_data
 
 
 class BadBlocksBlock(RDBBaseBlock):

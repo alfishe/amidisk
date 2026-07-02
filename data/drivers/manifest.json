@@ -1,0 +1,46 @@
+{
+  "drivers": [
+    {
+      "file": "pfs3aio",
+      "name": "pfs3aio",
+      "version": "19.2",
+      "dostypes": [
+        "0x50465303",
+        "0x50445303"
+      ],
+      "source": "aminet disk/misc/pfs3aio.lha"
+    },
+    {
+      "file": "SmartFilesystem",
+      "name": "SmartFilesystem",
+      "version": "1.279",
+      "dostypes": [
+        "0x53465300"
+      ],
+      "source": "aminet disk/misc/SFS.lha (AmigaOS3.x/L)"
+    },
+    {
+      "file": "FastFileSystem-47.4",
+      "name": "FastFileSystem",
+      "version": "47.4",
+      "dostypes": [
+        "0x444F5300",
+        "0x444F5301",
+        "0x444F5302",
+        "0x444F5303",
+        "0x444F5304",
+        "0x444F5305",
+        "0x444F5306",
+        "0x444F5307"
+      ],
+      "source": "extracted from data/OS-3.2.3.vhd RDB"
+    },
+    {
+      "file": "FastFileSystem-40.1",
+      "name": "FastFileSystem",
+      "version": "40.1",
+      "dostypes": [],
+      "source": "extracted from data/HARDFILE.hdf RDB (manual use only)"
+    }
+  ]
+}

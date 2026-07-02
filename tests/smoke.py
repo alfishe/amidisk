@@ -120,7 +120,7 @@ def test_fixture_images():
 # ---------------------------------------------------------------- write tests
 def test_ffs_write(tmp):
     print("== FFS write (all dostypes)")
-    for flavor in range(6):
+    for flavor in range(8):
         path = os.path.join(tmp, "dos%d.hdf" % flavor)
 
         def t(path=path, flavor=flavor):

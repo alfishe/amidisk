@@ -31,7 +31,7 @@ HTAB_ID = 0x48544142         # 'HTAB'
 SLNK_ID = 0x534C4E4B         # 'SLNK'
 ADMC_ID = 0x41444D43         # 'ADMC'
 TROK_ID = 0x54524F4B         # 'TROK'
-NODC_ID = 0x4E4F4443         # 'NODC'
+NODC_ID = 0x4E444320         # 'NDC ' (per AROS nodes.h and real volumes)
 BTMP_ID = 0x42544D50         # 'BTMP'
 
 STRUCTURE_VERSION = 3
@@ -47,9 +47,11 @@ ROOTNODE = 1
 RECYCLEDNODE = 2
 
 def _sfs_hash(name, casesensitive=False):
-    h = 0
+    """asfs_hash: seeded with the name length (verified against hash16
+    values written by the real SmartFilesystem handler)."""
+    name = name.split(b"/")[0] if b"/" in name else name
+    h = len(name)
     for c in name:
-        if c == ord(b'/'): break
         if not casesensitive:
             if (0x61 <= c <= 0x7A) or (0xE0 <= c <= 0xFE and c != 0xF7):
                 c -= 32
@@ -119,6 +121,7 @@ class SFSVolume:
         self.dos_type = dos_type
         self.read_only = True
         self.label = None
+        self.max_name_len = 107
         # block size comes from the root block; start with device blocks
         self.spb = 1
         self.bs = blkdev.block_bytes
@@ -202,6 +205,7 @@ class SFSVolume:
         self.label = self.root_obj.name_str()
         # free block count lives in fsRootInfo at the container's tail
         (self.freeblocks,) = struct.unpack_from(">I", cont, self.bs - 36 + 8)
+        self.read_only = self.dev.read_only
         return self
 
     def dos_type_str(self):
@@ -264,7 +268,9 @@ class SFSVolume:
         # 2. Root ObjectContainer
         raw_objc = bytearray(self.bs)
         struct.pack_into(">HHII", raw_objc, 24, 0, 0, ROOTNODE, 15)
-        struct.pack_into(">2I", raw_objc, 36, block_root + 1, 0)
+        # dir union: hashtable, firstdirblock -- the recycled container IS
+        # the first container of the root directory chain
+        struct.pack_into(">2I", raw_objc, 36, block_root + 1, block_recycled)
         struct.pack_into(">I", raw_objc, 44, currentdate)
         raw_objc[48] = OTYPE_DIR
         raw_objc[49:49+len(label)] = label
@@ -296,14 +302,11 @@ class SFSVolume:
         
         # 6. ObjectNode root
         raw_nodc = bytearray(self.bs)
-        struct.pack_into(">2I", raw_nodc, 12, 1, 1)
-        struct.pack_into(">I", raw_nodc, 20, block_root)
-        struct.pack_into(">I", raw_nodc, 28, block_recycled)
-        struct.pack_into(">H", raw_nodc, 32, h)
-        struct.pack_into(">I", raw_nodc, 36, 0xFFFFFFFF)
-        struct.pack_into(">I", raw_nodc, 44, 0xFFFFFFFF)
-        struct.pack_into(">I", raw_nodc, 52, 0xFFFFFFFF)
-        struct.pack_into(">I", raw_nodc, 60, 0xFFFFFFFF)
+        struct.pack_into(">2I", raw_nodc, 12, 1, 1)  # nodenumber=1, leaf
+        # fsObjectNode slots are 10 bytes: data(4) next(4) hash16(2);
+        # slot 0 = node 1 (root object), slot 1 = node 2 (.recycled)
+        struct.pack_into(">IIH", raw_nodc, 20, block_root, 0, 0)
+        struct.pack_into(">IIH", raw_nodc, 30, block_recycled, 0, h)
         self._fix_checksum(raw_nodc, NODC_ID, block_objectnoderoot)
         self._write_block(block_objectnoderoot, raw_nodc)
         
@@ -312,7 +315,7 @@ class SFSVolume:
         struct.pack_into(">I", raw_recy, 12, ROOTNODE)
         struct.pack_into(">HHII", raw_recy, 24, 0, 0, RECYCLEDNODE, 3)
         struct.pack_into(">I", raw_recy, 44, currentdate)
-        raw_recy[48] = OTYPE_DIR | 2 | 4 | OTYPE_HIDDEN
+        raw_recy[48] = OTYPE_DIR | 2 | 4  # dir, undeletable, quickdir
         recy_name = b".recycled"
         raw_recy[49:49+len(recy_name)] = recy_name
         self._fix_checksum(raw_recy, OBJC_ID, block_recycled)
@@ -519,6 +522,9 @@ class SFSVolume:
             self._write_block(bblock, raw)
 
     def _alloc_contiguous_blocks(self, count):
+        if count > self.freeblocks:
+            raise FSError("disk full: needed %d contiguous, %d free"
+                          % (count, self.freeblocks))
         bits_per_block = (self.bs - 12) * 8
         words_per_block = (self.bs - 12) // 4
         blocks_bitmap = (self.total + bits_per_block - 1) // bits_per_block
@@ -555,6 +561,9 @@ class SFSVolume:
         raise FSError("disk full or heavily fragmented (need %d contiguous)" % count)
 
     def _alloc_blocks(self, count):
+        if count > self.freeblocks:
+            raise FSError("disk full: needed %d blocks, %d free"
+                          % (count, self.freeblocks))
         chunks = []
         needed = count
         bits_per_block = (self.bs - 12) * 8
@@ -1171,6 +1180,53 @@ class SFSVolume:
                         errors.append("%s: %s" % (path, ex))
         except FSError as ex:
             errors.append("tree walk aborted: %s" % ex)
+        # handler-visibility: objects must be reachable through the node
+        # tree and (when the dir has a hashtable) through its hash chains
+        try:
+            seen = set()
+            for prefix, e in self.walk(""):
+                path = (prefix + "/" if prefix else "") + e.name_str()
+                if e.objectnode in seen:
+                    errors.append("%s: duplicate objectnode %d" % (path, e.objectnode))
+                seen.add(e.objectnode)
+                try:
+                    _, _, noff, ndata, _, nhash = self._getnode(e.objectnode)
+                except FSError as ex:
+                    errors.append("%s: objectnode unresolvable: %s" % (path, ex))
+                    continue
+                if ndata != e.objc_block:
+                    errors.append(
+                        "%s: node %d points to block %d, object lives in %d"
+                        % (path, e.objectnode, ndata, e.objc_block)
+                    )
+                want = _sfs_hash(e.name, self.case_sensitive)
+                if nhash != want:
+                    errors.append("%s: node hash16 %d != %d" % (path, nhash, want))
+            for prefix, d in list(self.walk("")) + [("", self.root_entry())]:
+                if not d.is_dir() or not d.hashtable:
+                    continue
+                dpath = (prefix + "/" if prefix else "") + d.name_str()
+                chain_nodes = set()
+                hraw = self._read_block(d.hashtable)
+                entries_per = (self.bs - 16) // 4
+                for i in range(entries_per):
+                    node = struct.unpack_from(">I", hraw, 16 + i * 4)[0]
+                    guard = 0
+                    while node:
+                        guard += 1
+                        if guard > MAX_CHAIN:
+                            errors.append("%s: cyclic hash chain" % dpath)
+                            break
+                        chain_nodes.add(node)
+                        _, _, _, _, node, _ = self._getnode(node)
+                for c in self._dir_entries(d):
+                    if c.objectnode not in chain_nodes:
+                        errors.append(
+                            "%s/%s: not reachable via the directory hashtable"
+                            % (dpath, c.name_str())
+                        )
+        except FSError as ex:
+            errors.append("consistency pass aborted: %s" % ex)
         return {
             "files": n_files,
             "dirs": n_dirs,
@@ -1179,3 +1235,708 @@ class SFSVolume:
             "warnings": warnings,
             "ok": not errors,
         }
+
+    # ======================================================================
+    # corrected + extended write layer (v2)
+    # Overrides the earlier draft methods (later definitions win): adds
+    # objectnode registration, hashtable maintenance, RootInfo freeblocks
+    # accounting, overwrite/mkdir/delete/rename, and metadata support.
+    # Ported from the asfs Linux driver's RW code (nodes.c, objects.c,
+    # extents.c, adminspace.c).
+    # ======================================================================
+
+    def _require_writable(self):
+        if self.dev.read_only:
+            raise FSError("SFS volume is read-only")
+
+    def _node_shift(self):
+        return (self.bs.bit_length() - 1) - 5  # blocksize_bits - BLCKFACCURACY
+
+    def _set_freeblocks(self, value):
+        self.freeblocks = value
+        raw = bytearray(self._read_block(self.rootobjectcontainer))
+        struct.pack_into(">I", raw, self.bs - 36 + 8, value)
+        self._write_block(self.rootobjectcontainer, raw)
+
+    def _mark_space(self, start, count, free=True):
+        """Override: also maintains the RootInfo free-block counter."""
+        bits_per_block = (self.bs - 12) * 8
+        blk = start
+        remaining = count
+        while remaining > 0:
+            bblock = self.bitmapbase + blk // bits_per_block
+            bit_offset = blk % bits_per_block
+            raw = bytearray(self._read_block(bblock))
+            while remaining > 0 and bit_offset < bits_per_block:
+                word_idx, bit_in_word = bit_offset // 32, bit_offset % 32
+                w = struct.unpack_from(">I", raw, 12 + word_idx * 4)[0]
+                if free:
+                    w |= 1 << (31 - bit_in_word)
+                else:
+                    w &= ~(1 << (31 - bit_in_word))
+                struct.pack_into(">I", raw, 12 + word_idx * 4, w & 0xFFFFFFFF)
+                blk += 1
+                remaining -= 1
+                bit_offset += 1
+            self._write_block(bblock, raw)
+        self._set_freeblocks(
+            self.freeblocks + (count if free else -count)
+        )
+
+    # -- object node tree ---------------------------------------------------
+    def _node_path(self, nodeno):
+        """Descend to the leaf holding nodeno; returns (path, leaf_blk, raw).
+        path = [(blk, raw, entry_index)] of index containers, root first."""
+        shift = self._node_shift()
+        blk = self.objectnoderoot
+        path = []
+        guard = 0
+        while True:
+            guard += 1
+            if guard > 64:
+                raise FSError("node tree too deep")
+            raw = bytearray(self._read_block(blk))
+            if struct.unpack_from(">I", raw, 0)[0] != 0x4E444320:  # 'NDC '
+                raise FSError("bad NDC block at %d" % blk)
+            nodenumber, nodes = struct.unpack_from(">II", raw, 12)
+            if nodes == 1:
+                return path, blk, raw, nodenumber
+            idx = (nodeno - nodenumber) // nodes
+            ptr = struct.unpack_from(">I", raw, 20 + idx * 4)[0]
+            if ptr == 0:
+                raise FSError("node %d not present in tree" % nodeno)
+            path.append((blk, raw, idx))
+            blk = (ptr >> shift) & ~0 if shift else ptr
+            blk = (ptr >> shift)
+            blk &= ~0  # no-op clarity
+            blk = (ptr >> shift)
+
+    def _getnode(self, nodeno):
+        """-> (leaf_blk, leaf_raw, slot_off, data, next, hash16)."""
+        path, blk, raw, nodenumber = self._node_path(nodeno)
+        off = 20 + (nodeno - nodenumber) * 10
+        if off + 10 > self.bs:
+            raise FSError("node %d out of leaf bounds" % nodeno)
+        data, nxt, h16 = struct.unpack_from(">IIH", raw, off)
+        return blk, raw, off, data, nxt, h16
+
+    def _leaf_is_full(self, raw):
+        cap = (self.bs - 20) // 10
+        nodenumber = struct.unpack_from(">I", raw, 12)[0]
+        for n in range(cap):
+            if nodenumber + n == 0:
+                continue
+            if struct.unpack_from(">I", raw, 20 + n * 10)[0] == 0:
+                return False
+        return True
+
+    def _index_is_full(self, raw):
+        cap = (self.bs - 20) // 4
+        for n in range(cap):
+            ptr = struct.unpack_from(">I", raw, 20 + n * 4)[0]
+            if ptr == 0 or not (ptr & 1):
+                return False
+        return True
+
+    def _update_full_bits(self, path, child_full):
+        """Propagate the child's full state up the index containers."""
+        for blk, raw, idx in reversed(path):
+            ptr = struct.unpack_from(">I", raw, 20 + idx * 4)[0]
+            was_container_full = self._index_is_full(raw)
+            if child_full:
+                ptr |= 1
+            else:
+                ptr &= ~1
+            struct.pack_into(">I", raw, 20 + idx * 4, ptr)
+            self._write_block(blk, raw)
+            if child_full:
+                child_full = self._index_is_full(raw)
+                if not child_full:
+                    break
+            else:
+                if not was_container_full:
+                    break
+                child_full = False
+
+    def _set_node(self, nodeno, data, nxt, h16):
+        path, blk, raw, nodenumber = self._node_path(nodeno)
+        off = 20 + (nodeno - nodenumber) * 10
+        struct.pack_into(">IIH", raw, off, data, nxt, h16)
+        self._write_block(blk, raw)
+        self._update_full_bits(path, self._leaf_is_full(raw))
+
+    def _alloc_objectnode(self):
+        """Find, but do not claim, a free node number (claim via _set_node)."""
+        shift = self._node_shift()
+        leafcap = (self.bs - 20) // 10
+        idxcap = (self.bs - 20) // 4
+
+        def descend(blk):
+            raw = bytearray(self._read_block(blk))
+            nodenumber, nodes = struct.unpack_from(">II", raw, 12)
+            if nodes == 1:
+                for n in range(leafcap):
+                    if nodenumber + n == 0:
+                        continue
+                    if struct.unpack_from(">I", raw, 20 + n * 10)[0] == 0:
+                        return nodenumber + n
+                return None
+            for n in range(idxcap):
+                ptr = struct.unpack_from(">I", raw, 20 + n * 4)[0]
+                if ptr and not (ptr & 1):
+                    r = descend(ptr >> shift)
+                    if r is not None:
+                        return r
+            # try an unused slot: create a child container there
+            for n in range(idxcap):
+                ptr = struct.unpack_from(">I", raw, 20 + n * 4)[0]
+                if ptr == 0:
+                    child_nodes = 1 if nodes == leafcap else nodes // idxcap
+                    newblk = self._alloc_adminspace()
+                    newraw = bytearray(self.bs)
+                    struct.pack_into(">I", newraw, 0, 0x4E444320)
+                    struct.pack_into(">I", newraw, 8, newblk)
+                    struct.pack_into(">II", newraw, 12,
+                                     nodenumber + n * nodes, child_nodes)
+                    self._write_block(newblk, newraw)
+                    struct.pack_into(">I", raw, 20 + n * 4, newblk << shift)
+                    self._write_block(blk, raw)
+                    return descend(newblk)
+            return None
+
+        r = descend(self.objectnoderoot)
+        if r is not None:
+            return r
+        # tree is completely full: add a new level (asfs addnewnodelevel)
+        raw = bytearray(self._read_block(self.objectnoderoot))
+        nodenumber, nodes = struct.unpack_from(">II", raw, 12)
+        newblk = self._alloc_adminspace()
+        newraw = bytearray(raw)
+        struct.pack_into(">I", newraw, 8, newblk)
+        self._write_block(newblk, newraw)
+        newnodes = leafcap if nodes == 1 else nodes * idxcap
+        fresh = bytearray(self.bs)
+        struct.pack_into(">I", fresh, 0, 0x4E444320)
+        struct.pack_into(">I", fresh, 8, self.objectnoderoot)
+        struct.pack_into(">II", fresh, 12, nodenumber, newnodes)
+        struct.pack_into(">I", fresh, 20, (newblk << self._node_shift()) | 1)
+        self._write_block(self.objectnoderoot, fresh)
+        return self._alloc_objectnode()
+
+    def _free_objectnode(self, nodeno):
+        self._set_node(nodeno, 0, 0, 0)
+
+    # -- hashtable maintenance ------------------------------------------------
+    def _hash_chain_index(self, h16):
+        return h16 % ((self.bs - 16) // 4)
+
+    def _hash_insert(self, parent, nodeno, h16):
+        if not parent.hashtable:
+            return
+        hraw = bytearray(self._read_block(parent.hashtable))
+        idx = self._hash_chain_index(h16)
+        head = struct.unpack_from(">I", hraw, 16 + idx * 4)[0]
+        _, _, _, data, _, hh = self._getnode(nodeno)
+        self._set_node(nodeno, data, head, h16)
+        struct.pack_into(">I", hraw, 16 + idx * 4, nodeno)
+        self._write_block(parent.hashtable, hraw)
+
+    def _hash_remove(self, parent, entry):
+        if not parent.hashtable:
+            return
+        h16 = _sfs_hash(entry.name, self.case_sensitive)
+        idx = self._hash_chain_index(h16)
+        hraw = bytearray(self._read_block(parent.hashtable))
+        node = struct.unpack_from(">I", hraw, 16 + idx * 4)[0]
+        prev = 0
+        guard = 0
+        while node and node != entry.objectnode:
+            guard += 1
+            if guard > MAX_CHAIN:
+                raise FSError("cyclic hash chain")
+            prev = node
+            _, _, _, _, node, _ = self._getnode(node)
+        if not node:
+            return  # not hashed (legal for dirs without hashing)
+        _, _, _, _, nxt, _ = self._getnode(entry.objectnode)
+        if prev == 0:
+            struct.pack_into(">I", hraw, 16 + idx * 4, nxt)
+            self._write_block(parent.hashtable, hraw)
+        else:
+            _, _, _, pdata, _, ph = self._getnode(prev)
+            self._set_node(prev, pdata, nxt, ph)
+
+    # -- object container manipulation ----------------------------------------
+    def _normalize_parent(self, entry):
+        if entry.objectnode == ROOTNODE and entry.objc_block == 0:
+            entry.objc_block = self.rootobjectcontainer
+            entry.objc_offset = 24
+        return entry
+
+    def _locate(self, parent, name):
+        """(container_blk, offset, entry) of name in parent, or None."""
+        block = parent.firstdirblock
+        guard = 0
+        while block:
+            guard += 1
+            if guard > MAX_CHAIN:
+                raise FSError("cyclic container chain")
+            raw = self._read_checked(block, OBJC_ID)
+            for e in self._iter_container_objects(raw, block):
+                if self._names_equal(e.name, name):
+                    return block, e.objc_offset, e
+            block = struct.unpack_from(">I", raw, 16)[0]
+        return None
+
+    def _container_end(self, raw):
+        off = 24
+        while off + 27 < self.bs:
+            if struct.unpack_from(">I", raw, off + 4)[0] == 0:
+                break
+            e = self._parse_object(raw, off)
+            off += 25 + len(e.name) + 1 + len(e.comment) + 1
+            if off & 1:
+                off += 1
+        return off
+
+    def _build_object(self, name, nodeno, size, data_or_ht, fdb, bits,
+                      protect=0, comment=b"", mtime=None):
+        name = bytes(name)
+        if not 1 <= len(name) <= 100:
+            raise FSError("invalid SFS name length")
+        if b"/" in name or b":" in name or b"\x00" in name or any(c < 32 for c in name):
+            raise FSError("invalid characters in name")
+        comment = bytes(comment)[:79]
+        secs = int(((mtime or __import__("datetime").datetime.now())
+                    - EPOCH).total_seconds())
+        raw = bytearray(25)
+        # SFS stores RWED active-high: flip the AmigaDOS low nibble
+        struct.pack_into(">HHII", raw, 0, 0, 0, nodeno, (protect ^ 0x0F) & 0xFFFFFFFF)
+        struct.pack_into(">2I", raw, 12, data_or_ht, fdb if bits & OTYPE_DIR else size)
+        struct.pack_into(">I", raw, 20, max(0, secs))
+        raw[24] = bits
+        raw += name + b"\x00" + comment + b"\x00"
+        if len(raw) & 1:
+            raw += b"\x00"
+        return bytes(raw)
+
+    def _insert_object(self, parent, obj_data):
+        """Insert object bytes into parent's container chain; returns blk."""
+        parent = self._normalize_parent(parent)
+        block = parent.firstdirblock
+        if block == 0:
+            block = self._alloc_adminspace()
+            raw = bytearray(self.bs)
+            struct.pack_into(">I", raw, 0, OBJC_ID)
+            struct.pack_into(">I", raw, 8, block)
+            struct.pack_into(">I", raw, 12, parent.objectnode)
+            raw[24 : 24 + len(obj_data)] = obj_data
+            self._write_block(block, raw)
+            parent.firstdirblock = block
+            praw = bytearray(self._read_block(parent.objc_block))
+            struct.pack_into(">I", praw, parent.objc_offset + 16, block)
+            self._write_block(parent.objc_block, praw)
+            return block
+        guard = 0
+        while True:
+            guard += 1
+            if guard > MAX_CHAIN:
+                raise FSError("cyclic container chain")
+            raw = bytearray(self._read_block(block))
+            end = self._container_end(raw)
+            if end + len(obj_data) + 2 <= self.bs:
+                raw[end : end + len(obj_data)] = obj_data
+                self._write_block(block, raw)
+                return block
+            nxt = struct.unpack_from(">I", raw, 16)[0]
+            if nxt == 0:
+                newblk = self._alloc_adminspace()
+                nraw = bytearray(self.bs)
+                struct.pack_into(">I", nraw, 0, OBJC_ID)
+                struct.pack_into(">I", nraw, 8, newblk)
+                struct.pack_into(">I", nraw, 12,
+                                 struct.unpack_from(">I", raw, 12)[0])
+                struct.pack_into(">I", nraw, 20, block)  # previous
+                nraw[24 : 24 + len(obj_data)] = obj_data
+                self._write_block(newblk, nraw)
+                struct.pack_into(">I", raw, 16, newblk)
+                self._write_block(block, raw)
+                return newblk
+            block = nxt
+
+    def _remove_object(self, parent, entry):
+        """Remove the object's bytes from its container; compacts, and
+        unlinks empty non-head containers."""
+        parent = self._normalize_parent(parent)
+        raw = bytearray(self._read_block(entry.objc_block))
+        off = entry.objc_offset
+        size = 25 + len(entry.name) + 1 + len(entry.comment) + 1
+        if size & 1:
+            size += 1
+        end = self._container_end(raw)
+        raw[off : end - size] = raw[off + size : end]
+        raw[end - size : end] = b"\x00" * size
+        self._write_block(entry.objc_block, raw)
+        if struct.unpack_from(">I", raw, 28)[0] == 0 and \
+                entry.objc_block != parent.firstdirblock:
+            nxt = struct.unpack_from(">I", raw, 16)[0]
+            prev = struct.unpack_from(">I", raw, 20)[0]
+            if prev:
+                praw = bytearray(self._read_block(prev))
+                struct.pack_into(">I", praw, 16, nxt)
+                self._write_block(prev, praw)
+            if nxt:
+                nraw = bytearray(self._read_block(nxt))
+                struct.pack_into(">I", nraw, 20, prev)
+                self._write_block(nxt, nraw)
+            self._free_adminspace(entry.objc_block)
+
+    def _free_adminspace(self, block):
+        admin_block = self.adminspacecontainer
+        adminspaces = (self.bs - 24) // 8
+        guard = 0
+        while admin_block and guard < MAX_CHAIN:
+            guard += 1
+            raw = bytearray(self._read_block(admin_block))
+            for i in range(adminspaces):
+                space, bits = struct.unpack_from(">II", raw, 24 + i * 8)
+                if space and space <= block < space + 32:
+                    bits &= ~(1 << (31 - (block - space)))
+                    struct.pack_into(">I", raw, 24 + i * 8 + 4, bits & 0xFFFFFFFF)
+                    self._write_block(admin_block, raw)
+                    return
+            admin_block = struct.unpack_from(">I", raw, 16)[0]
+        raise FSError("adminspace for block %d not found" % block)
+
+    # -- extents removal --------------------------------------------------------
+    def _remove_extent(self, key):
+        """Remove the extent keyed `key`; returns (next, blocks)."""
+        path = []
+        blk = self.extentbnoderoot
+        guard = 0
+        while True:
+            guard += 1
+            if guard > 64:
+                raise FSError("extent btree too deep")
+            raw = bytearray(self._read_checked(blk, BNDC_ID))
+            nodecount, isleaf, nodesize = struct.unpack_from(">HBB", raw, 12)
+            if isleaf:
+                break
+            chosen = None
+            for n in range(nodecount - 1, -1, -1):
+                nkey = struct.unpack_from(">I", raw, 16 + n * nodesize)[0]
+                if n == 0 or key >= nkey:
+                    chosen = n
+                    break
+            path.append((blk, raw, chosen, nodesize, nodecount))
+            blk = struct.unpack_from(">I", raw, 16 + chosen * nodesize + 4)[0]
+        # find + remove in leaf
+        found = None
+        for n in range(nodecount):
+            if struct.unpack_from(">I", raw, 16 + n * nodesize)[0] == key:
+                found = n
+                break
+        if found is None:
+            raise FSError("extent %d not found" % key)
+        _, nxt, prv, blocks = struct.unpack_from(">IIIH", raw, 16 + found * nodesize)
+        end = 16 + nodecount * nodesize
+        s = 16 + found * nodesize
+        raw[s : end - nodesize] = raw[s + nodesize : end]
+        raw[end - nodesize : end] = b"\x00" * nodesize
+        struct.pack_into(">H", raw, 12, nodecount - 1)
+        self._write_block(blk, raw)
+        # collapse empty non-root leaves out of their parents
+        while nodecount - 1 == 0 and path:
+            child = blk
+            blk, raw, chosen, nodesize, nodecount = path.pop()
+            for n in range(nodecount):
+                if struct.unpack_from(">I", raw, 16 + n * nodesize + 4)[0] == child:
+                    end = 16 + nodecount * nodesize
+                    s = 16 + n * nodesize
+                    raw[s : end - nodesize] = raw[s + nodesize : end]
+                    raw[end - nodesize : end] = b"\x00" * nodesize
+                    struct.pack_into(">H", raw, 12, nodecount - 1)
+                    self._write_block(blk, raw)
+                    break
+            self._free_adminspace(child)
+            nodecount -= 1
+        # fix neighbour links
+        if prv:
+            praw = bytearray(self._read_block(self._extent_leaf_of(prv)))
+            self._patch_extent_field(prv, next_val=nxt)
+        if nxt:
+            self._patch_extent_field(nxt, prev_val=prv)
+        return nxt, blocks
+
+    def _extent_leaf_of(self, key):
+        blk = self.extentbnoderoot
+        guard = 0
+        while True:
+            guard += 1
+            if guard > 64:
+                raise FSError("extent btree too deep")
+            raw = self._read_checked(blk, BNDC_ID)
+            nodecount, isleaf, nodesize = struct.unpack_from(">HBB", raw, 12)
+            if isleaf:
+                return blk
+            for n in range(nodecount - 1, -1, -1):
+                nkey = struct.unpack_from(">I", raw, 16 + n * nodesize)[0]
+                if n == 0 or key >= nkey:
+                    blk = struct.unpack_from(">I", raw, 16 + n * nodesize + 4)[0]
+                    break
+
+    def _patch_extent_field(self, key, next_val=None, prev_val=None):
+        blk = self._extent_leaf_of(key)
+        raw = bytearray(self._read_block(blk))
+        nodecount, isleaf, nodesize = struct.unpack_from(">HBB", raw, 12)
+        for n in range(nodecount):
+            if struct.unpack_from(">I", raw, 16 + n * nodesize)[0] == key:
+                if next_val is not None:
+                    struct.pack_into(">I", raw, 16 + n * nodesize + 4, next_val)
+                if prev_val is not None:
+                    struct.pack_into(">I", raw, 16 + n * nodesize + 8, prev_val)
+                self._write_block(blk, raw)
+                return
+        raise FSError("extent %d not found for patch" % key)
+
+    # -- public mutating API ------------------------------------------------------
+    def _split_parent(self, path):
+        parts = self._split(path)
+        if not parts:
+            raise FSError("empty path")
+        parent = self.resolve(b"/".join(parts[:-1]))
+        if not parent.is_dir():
+            raise FSError("parent is not a directory")
+        return self._normalize_parent(parent), parts[-1]
+
+    def write_file(self, path, data, size=None, protect=0, comment=b"",
+                   mtime=None):
+        self._require_writable()
+        parent, name = self._split_parent(path)
+        if size is None:
+            if hasattr(data, "__len__"):
+                size = len(data)
+            else:
+                raise FSError("size= is required for streaming sources")
+        if size >= 1 << 32:
+            raise FSError("files >= 4 GB not supported")
+        existing = self._locate(parent, name)
+        if existing is not None:
+            if not existing[2].is_file():
+                raise FSError("exists and is not a file: %s" % path)
+            self.delete(existing[2])
+            parent = self._normalize_parent(self.resolve(
+                b"/".join(self._split(path)[:-1])))
+        nodeno = self._alloc_objectnode()
+        blocks_needed = (size + self.bs - 1) // self.bs
+        first = 0
+        if blocks_needed:
+            chunks = self._alloc_blocks(blocks_needed)
+            first = chunks[0][0]
+            try:
+                self._stream_into(data, size, chunks)
+            except Exception:
+                for s, c in chunks:
+                    self._mark_space(s, c, free=True)
+                raise
+            # fsExtentBNode.blocks is a u16: split long runs into chained
+            # extents of at most 65535 blocks, like the real handler
+            runs = []
+            for s, c in chunks:
+                while c > 0:
+                    n = min(c, 0xFFFF)
+                    runs.append((s, n))
+                    s += n
+                    c -= n
+            for i, (s, c) in enumerate(runs):
+                nxt = runs[i + 1][0] if i + 1 < len(runs) else 0
+                prv = runs[i - 1][0] if i > 0 else 0
+                self._add_extent(s, nxt, prv, c)
+        obj = self._build_object(name, nodeno, size, first, 0, 0,
+                                 protect, comment, mtime)
+        blk = self._insert_object(parent, obj)
+        h16 = _sfs_hash(name, self.case_sensitive)
+        self._set_node(nodeno, blk, 0, h16)
+        self._hash_insert(parent, nodeno, h16)
+        self._touch_volume()
+        return nodeno
+
+    def _stream_into(self, data, size, chunks):
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            it = iter([bytes(data)])
+        elif hasattr(data, "read"):
+            def _gen(fh):
+                while True:
+                    b = fh.read(1 << 20)
+                    if not b:
+                        return
+                    yield b
+            it = _gen(data)
+        else:
+            it = iter(data)
+        buf = bytearray()
+        written = 0
+        for s, c in chunks:
+            want = min(c * self.bs, size - written)
+            while len(buf) < want:
+                try:
+                    buf += next(it)
+                except StopIteration:
+                    raise FSError("stream ended %d bytes early"
+                                  % (size - written - len(buf)))
+            chunk = bytes(buf[:want])
+            del buf[:want]
+            pad = (-len(chunk)) % self.bs
+            if pad:
+                chunk += b"\x00" * pad
+            self.dev.write(s * self.spb, chunk)
+            written += want
+
+    def mkdir(self, path):
+        self._require_writable()
+        parent, name = self._split_parent(path)
+        if self._locate(parent, name):
+            raise FSError("already exists: %s" % path)
+        nodeno = self._alloc_objectnode()
+        obj = self._build_object(name, nodeno, 0, 0, 0, OTYPE_DIR)
+        blk = self._insert_object(parent, obj)
+        h16 = _sfs_hash(name, self.case_sensitive)
+        self._set_node(nodeno, blk, 0, h16)
+        self._hash_insert(parent, nodeno, h16)
+        self._touch_volume()
+        return nodeno
+
+    def makedirs(self, path):
+        parts = self._split(path)
+        cur = b""
+        for seg in parts:
+            cur = cur + b"/" + seg if cur else seg
+            try:
+                e = self.resolve(cur)
+                if not e.is_dir():
+                    raise FSError("'%s' exists and is not a directory"
+                                  % cur.decode("latin-1"))
+            except FSError as ex:
+                if "not found" not in str(ex):
+                    raise
+                self.mkdir(cur)
+
+    def _delete_file_data(self, entry):
+        key = entry.data
+        guard = 0
+        while key:
+            guard += 1
+            if guard > MAX_CHAIN:
+                raise FSError("cyclic extent chain")
+            nxt, blocks = self._remove_extent(key)
+            self._mark_space(key, blocks, free=True)
+            key = nxt
+
+    def _find_parent_entry(self, entry):
+        """Parent directory entry of an object (via container.parent)."""
+        raw = self._read_block(entry.objc_block)
+        pnode = struct.unpack_from(">I", raw, 12)[0]
+        if pnode == ROOTNODE:
+            return self._normalize_parent(self.root_entry())
+        _, _, _, data, _, _ = self._getnode(pnode)
+        praw = self._read_checked(data, OBJC_ID)
+        for e in self._iter_container_objects(praw, data):
+            if e.objectnode == pnode:
+                return e
+        raise FSError("parent object %d not found" % pnode)
+
+    def delete(self, path, recursive=False):
+        self._require_writable()
+        if isinstance(path, SFSEntry):
+            if path.objectnode == ROOTNODE:
+                raise FSError("cannot delete the root directory")
+            parent = self._find_parent_entry(path)
+            name = path.name
+        else:
+            parent, name = self._split_parent(path)
+        self._delete_by_name(parent, name, recursive)
+        self._touch_volume()
+
+    def _delete_by_name(self, parent, name, recursive):
+        """Delete `name` from `parent`, re-locating everything fresh --
+        container compaction invalidates any previously held offsets."""
+        parent = self._normalize_parent(parent)
+        loc = self._locate(parent, name)
+        if loc is None:
+            raise FSError("entry not found: %r" % name)
+        _, _, entry = loc
+        if entry.is_dir():
+            kids = self._dir_entries(entry)
+            if kids and not recursive:
+                raise FSError("directory not empty: %s" % entry.name_str())
+            while kids:
+                self._delete_by_name(entry, kids[0].name, True)
+                # the dir object itself never moves while its children
+                # change, but re-read to stay honest about firstdirblock
+                entry = self._locate(parent, name)[2]
+                kids = self._dir_entries(entry)
+            blk = entry.firstdirblock
+            guard = 0
+            while blk and guard < MAX_CHAIN:
+                guard += 1
+                raw = self._read_block(blk)
+                nxt = struct.unpack_from(">I", raw, 16)[0]
+                self._free_adminspace(blk)
+                blk = nxt
+            if entry.hashtable:
+                self._free_adminspace(entry.hashtable)
+        elif entry.is_file():
+            self._delete_file_data(entry)
+        elif entry.is_link() and entry.data:
+            self._free_adminspace(entry.data)  # SLNK block
+        self._hash_remove(parent, entry)
+        self._free_objectnode(entry.objectnode)
+        self._remove_object(parent, entry)
+
+    def rename(self, src, dst):
+        self._require_writable()
+        entry = self.resolve(src)
+        if entry.objectnode == ROOTNODE:
+            raise FSError("cannot rename the root directory")
+        new_parent, new_name = self._split_parent(dst)
+        clash = self._locate(new_parent, new_name)
+        if clash is not None and clash[2].objectnode != entry.objectnode:
+            raise FSError("destination exists: %s" % dst)
+        if entry.is_dir():
+            p = new_parent
+            guard = 0
+            while p.objectnode != ROOTNODE and guard < MAX_CHAIN:
+                guard += 1
+                if p.objectnode == entry.objectnode:
+                    raise FSError("cannot move a directory into itself")
+                p = self._find_parent_entry(p)
+        old_parent = self._find_parent_entry(entry)
+        self._hash_remove(old_parent, entry)
+        self._remove_object(old_parent, entry)
+        bits = entry.bits
+        a = entry.hashtable if entry.is_dir() else entry.data
+        b = entry.firstdirblock if entry.is_dir() else entry.size
+        obj = self._build_object(
+            new_name, entry.objectnode,
+            entry.size, a, entry.firstdirblock, bits,
+            (entry.protect ^ 0x0F) & 0xFFFFFFFF, entry.comment,
+            _sfs_time(entry.secs),
+        )
+        # refresh parent (container layout may have shifted)
+        new_parent = self._normalize_parent(self.resolve(
+            b"/".join(self._split(dst)[:-1])))
+        blk = self._insert_object(new_parent, obj)
+        h16 = _sfs_hash(new_name, self.case_sensitive)
+        _, _, _, _, nxt, _ = self._getnode(entry.objectnode)
+        self._set_node(entry.objectnode, blk, 0, h16)
+        self._hash_insert(new_parent, entry.objectnode, h16)
+        # containers of a moved directory keep parent = its own node: ok
+        self._touch_volume()
+
+    def _touch_volume(self):
+        """Volume modification -> root object datemodified (never the
+        rootblock, whose datecreated is immutable)."""
+        secs = int((__import__("datetime").datetime.now() - EPOCH).total_seconds())
+        raw = bytearray(self._read_block(self.rootobjectcontainer))
+        struct.pack_into(">I", raw, 24 + 20, max(0, secs))
+        self._write_block(self.rootobjectcontainer, raw)

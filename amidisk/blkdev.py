@@ -75,6 +75,7 @@ class ImageFileBlkDev(BlockDevice):
 
     def flush(self):
         self.fh.flush()
+        os.fsync(self.fh.fileno())
 
     def close(self):
         self.fh.close()

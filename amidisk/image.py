@@ -74,6 +74,14 @@ class VolumeRef:
             self._vol = self.raw_volume().open()
         return self._vol
 
+    def identify(self):
+        """Best-effort identification when mount() is not possible."""
+        if self.partition is not None:
+            return identify_volume(
+                self.partition.create_blkdev(), self.partition.dos_env.dos_type
+            )
+        return identify_volume(self.image.blkdev, None)
+
     def label(self):
         try:
             return self.mount().label
@@ -199,6 +207,21 @@ class DiskImage:
             info["rdb"] = self.rdisk.get_info()
             info["partitions"] = [p.get_info() for p in self.rdisk.get_partitions()]
             info["filesystems"] = [f.get_info() for f in self.rdisk.get_filesystems()]
+        # one authoritative per-volume section: mounted volume info when an
+        # engine can serve it, best-effort identification otherwise
+        vols = []
+        for v in self.volumes:
+            entry = {"name": v.name}
+            try:
+                entry["volume"] = v.mount().get_info()
+            except Exception as ex:
+                entry["error"] = str(ex)
+                try:
+                    entry["identify"] = v.identify()
+                except Exception:
+                    pass
+            vols.append(entry)
+        info["volumes"] = vols
         return info
 
     def close(self):
@@ -209,6 +232,97 @@ class DiskImage:
 
     def __exit__(self, *exc):
         self.close()
+
+
+def identify_volume(dev, dos_type=None):
+    """Best-effort identification of a volume we cannot mount.
+
+    Returns a dict with the declared dostype, the first block's magic and
+    a list of human-readable guesses based on known on-disk signatures,
+    so `info` can say WHAT lives in a partition even when no engine can
+    serve it (CDFS, muFS, FAT, ext2, NDOS, foreign data...).
+    """
+    from .rdb.blocks import dos_type_to_str
+
+    out = {
+        "declared_dos_type": dos_type_to_str(dos_type) if dos_type else None,
+        "size_bytes": dev.num_blocks * dev.block_bytes,
+        "boot_magic": None,
+        "guesses": [],
+    }
+    guesses = out["guesses"]
+    try:
+        b0 = dev.read(0)
+    except Exception as ex:
+        guesses.append("unreadable first block: %s" % ex)
+        return out
+    magic = b0[0:4]
+    out["boot_magic"] = "".join(chr(c) if 32 <= c < 127 else "." for c in magic)
+
+    if magic[:3] == b"DOS" and magic[3] <= 7:
+        guesses.append("AmigaDOS bootblock (DOS\\%d)" % magic[3])
+    elif magic == b"NDOS":
+        guesses.append("NDOS marker: intentionally not a DOS disk")
+    elif magic[:3] == b"DOS":
+        guesses.append("AmigaDOS-style bootblock with unknown flavor %d" % magic[3])
+    if magic == b"SFS\x00" or magic == b"SFS\x02":
+        version = struct.unpack_from(">H", b0, 12)[0]
+        guesses.append("SFS root block, structure version %d" % version)
+    if magic == b"CDSF" or magic == b"CD01":
+        guesses.append("possible CD filesystem marker")
+    if magic in (b"muFS", b"muAF", b"muPF"):
+        guesses.append("multiuser filesystem (muFS family) bootblock")
+    try:
+        if dev.num_blocks > 2:
+            r2 = dev.read(2)
+            if r2[0:4] in (b"PFS\x01", b"PFS\x02", b"AFS\x01"):
+                guesses.append("PFS rootblock at block 2 (%r)" % r2[0:4])
+    except Exception:
+        pass
+    # PC-world signatures
+    if len(b0) >= 512 and b0[510:512] == b"\x55\xaa":
+        if b0[54:59] == b"FAT12" or b0[54:59] == b"FAT16":
+            guesses.append("FAT12/16 boot sector")
+        elif b0[82:87] == b"FAT32":
+            guesses.append("FAT32 boot sector")
+        else:
+            guesses.append("PC boot sector / MBR signature (0x55AA)")
+    try:
+        if dev.num_blocks * dev.block_bytes > 1084:
+            sb = dev.read(2)  # bytes 1024.. hold the ext superblock
+            if sb[56:58] == b"\x53\xef":
+                guesses.append("Linux ext2/3/4 superblock")
+    except Exception:
+        pass
+    # AmigaDOS structure without a valid bootblock: look for a root block
+    try:
+        total = dev.num_blocks
+        for spb in (1, 2, 4, 8):
+            tot = total // spb
+            root = (2 + tot - 1) // 2
+            raw = dev.read(root * spb, spb)
+            bs = 512 * spb
+            if (struct.unpack_from(">I", raw, 0)[0] == 2
+                    and struct.unpack_from(">i", raw, bs - 4)[0] == 1):
+                s = 0
+                for (v,) in struct.iter_unpack(">I", raw[:bs]):
+                    s = (s + v) & 0xFFFFFFFF
+                if s == 0:
+                    nl = raw[bs - 80]
+                    label = raw[bs - 79 : bs - 79 + min(nl, 30)].decode(
+                        "latin-1", "replace")
+                    guesses.append(
+                        "valid OFS/FFS root block at the midpoint (label %r, "
+                        "block size %d) -- bootblock may be damaged" % (label, bs))
+                    break
+    except Exception:
+        pass
+    if not guesses:
+        if magic == b"\x00\x00\x00\x00":
+            guesses.append("first block is blank: likely unformatted")
+        else:
+            guesses.append("no known filesystem signature found")
+    return out
 
 
 def open_image(path, writable=False):

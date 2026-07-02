@@ -1,13 +1,17 @@
-"""Native OFS/FFS filesystem engine (DOS\\0 .. DOS\\5), read and write.
+"""Native OFS/FFS filesystem engine (DOS\\0 .. DOS\\7), read and write.
 
 Block layouts follow Laurent Clevy's ADF format documentation and were
-cross-checked against amitools' amitools.fs and ADFlib. Supports any
-filesystem block size (de_SizeBlock * 4 * de_SecsPerBlk), as used by
-FFS 45+ volumes with 1-8 sectors per block.
+cross-checked against amitools and ADFlib. Supports any filesystem
+block size (de_SizeBlock * 4 * de_SecsPerBlk), as used by FFS 45+
+volumes with 1-8 sectors per block.
 
-Not supported: DOS\\6/\\7 long-filename volumes (mount refused); writing
-to DOS\\4/\\5 dircache volumes (dircache blocks are not maintained; such
-volumes open read-only).
+All eight classic dostypes are fully supported, including write:
+  DOS\\0/\\1  OFS / FFS
+  DOS\\2/\\3  + international mode
+  DOS\\4/\\5  + directory cache (cache chains maintained on every mutation)
+  DOS\\6/\\7  + long filenames (LNFS, FFS 45+/OS 3.1.4): names up to 107
+             chars in the combined name+comment field, overflow comments
+             in separate T_COMMENT blocks, dates at the moved location
 """
 
 import struct
@@ -26,6 +30,7 @@ T_HEADER = 2
 T_DATA = 8
 T_LIST = 16
 T_DIRCACHE = 33
+T_COMMENT = 64  # LNFS overflow comment block (DOS\6/\7)
 
 # secondary types
 ST_ROOT = 1
@@ -105,21 +110,41 @@ class Entry:
         "blk", "type", "sec_type", "name", "size", "protect", "comment",
         "days", "mins", "ticks", "hash_chain", "parent", "extension",
         "high_seq", "first_data", "real_entry", "uid", "gid",
+        "comment_block",
     )
 
     @classmethod
-    def parse(cls, buf, blk):
+    def parse(cls, buf, blk, is_longname=False):
         e = cls()
         e.blk = blk
         e.type = buf.long(0)
         e.sec_type = buf.slong(-1)
-        e.name = buf.bstr(buf.bs - 80, MAX_NAME)
+        
+        if is_longname:
+            nac = buf.data[buf.bs - 184 : buf.bs - 72]
+            name_len = min(nac[0], 107)
+            e.name = bytes(nac[1 : name_len + 1])
+            comment_len = nac[name_len + 1] if name_len + 1 < 112 else 0
+            e.comment_block = 0
+            if comment_len > 0:
+                e.comment = bytes(nac[name_len + 2 : name_len + 2 + comment_len])
+            else:
+                e.comment = b""
+                # an oversized comment lives in a separate T_COMMENT block
+                e.comment_block = buf.long(-18)
+            e.days = buf.long(-15)
+            e.mins = buf.long(-14)
+            e.ticks = buf.long(-13)
+        else:
+            e.comment_block = 0
+            e.name = buf.bstr(buf.bs - 80, MAX_NAME)
+            e.comment = buf.bstr(buf.bs - 184, MAX_COMMENT)
+            e.days = buf.long(-23)
+            e.mins = buf.long(-22)
+            e.ticks = buf.long(-21)
+            
         e.size = buf.long(-47)          # byte_size
         e.protect = buf.long(-48)
-        e.comment = buf.bstr(buf.bs - 184, MAX_COMMENT)
-        e.days = buf.long(-23)
-        e.mins = buf.long(-22)
-        e.ticks = buf.long(-21)
         e.hash_chain = buf.long(-4)
         e.parent = buf.long(-3)
         e.extension = buf.long(-2)
@@ -181,6 +206,7 @@ class Bitmap:
         self.pages = []
         self.dirty = set()
         self._cursor = vol.root_blk + 1
+        self._free_count = None
 
     def load(self):
         vol = self.vol
@@ -230,18 +256,36 @@ class Bitmap:
         li = 1 + off // 32
         word = buf.long(li)
         bit = 1 << (off % 32)
-        buf.put_long(li, (word | bit) if free else (word & ~bit))
-        self.dirty.add(page)
+        old_val = bool(word & bit)
+        if free != old_val:
+            buf.put_long(li, (word | bit) if free else (word & ~bit))
+            self.dirty.add(page)
+            if self._free_count is not None:
+                self._free_count += (1 if free else -1)
 
     def alloc(self, count):
         """Allocate `count` blocks; returns list or raises FSError."""
         vol = self.vol
+        # fail fast from the popcount instead of scanning the whole bitmap
+        if count > self.count_free():
+            raise FSError(
+                "disk full: needed %d blocks, %d free" % (count, self.count_free())
+            )
         found = []
         start = self._cursor if vol.reserved <= self._cursor < vol.total else vol.reserved
         blk = start
         total = vol.total
         wrapped = False
         while len(found) < count:
+            # skip fully-allocated 32-block words at word-compare speed
+            idx = blk - vol.reserved
+            if idx % 32 == 0 and blk + 32 <= total:
+                page, off = self._locate(blk)
+                if self.pages[page].long(1 + off // 32) == 0:
+                    blk += 32
+                    if wrapped and start <= blk:
+                        break
+                    continue
             if blk >= total:
                 blk = vol.reserved
                 wrapped = True
@@ -261,6 +305,8 @@ class Bitmap:
             self._set(b, True)
 
     def count_free(self):
+        if self._free_count is not None:
+            return self._free_count
         vol = self.vol
         valid_bits = vol.total - vol.reserved
         free = 0
@@ -277,6 +323,7 @@ class Bitmap:
                     word = buf.long(1 + off // 32)
                     cnt += (word >> (off % 32)) & 1
             free += cnt
+        self._free_count = free
         return free
 
     def flush(self):
@@ -331,11 +378,11 @@ class FFSVolume:
         flavor = self.dos_type & 0xFF
         if flavor > 7:
             raise FSError("unsupported DOS type flavor %d" % flavor)
-        if flavor in (6, 7):
-            raise FSError("long filename volumes (DOS\\6/\\7) not supported")
         self.ffs = bool(flavor & 1)
         self.intl = flavor >= 2
         self.dircache = flavor in (4, 5)
+        self.is_longname = flavor in (6, 7)
+        self.max_name_len = 107 if self.is_longname else MAX_NAME
 
         root = self.read_buf(self.root_blk)
         if not (
@@ -358,7 +405,7 @@ class FFSVolume:
 
     def root_entry(self):
         buf = self.read_buf(self.root_blk)
-        e = Entry.parse(buf, self.root_blk)
+        e = Entry.parse(buf, self.root_blk, self.is_longname)
         e.name = self.label.encode("latin-1")
         return e
 
@@ -388,9 +435,20 @@ class FFSVolume:
     @staticmethod
     def _split(path):
         if isinstance(path, str):
-            path = path.encode("latin-1")
+            path = path.encode("latin-1", errors="replace")
         parts = [p for p in path.replace(b"\\", b"/").split(b"/") if p]
         return parts
+
+    def _fill_comment(self, e):
+        """Load an LNFS overflow comment from its T_COMMENT block."""
+        if getattr(e, "comment_block", 0) and not e.comment:
+            try:
+                cbuf = self.read_buf(e.comment_block)
+                if cbuf.long(0) == T_COMMENT:
+                    e.comment = cbuf.bstr(24, MAX_COMMENT)
+            except FSError:
+                pass
+        return e
 
     def resolve(self, path):
         """Return Entry for path ('' or '/' = root) or raise FSError."""
@@ -405,6 +463,7 @@ class FFSVolume:
                 raise FSError("path not found: %s" % path)
             cur = nxt
             cur_buf = self.read_buf(cur.blk)
+        self._fill_comment(cur)
         return cur
 
     def _find_in_dir(self, dir_buf, name):
@@ -416,7 +475,7 @@ class FFSVolume:
             if guard > MAX_CHAIN:
                 raise FSError("cyclic hash chain")
             buf = self.read_buf(blk)
-            e = Entry.parse(buf, blk)
+            e = Entry.parse(buf, blk, self.is_longname)
             if names_equal(e.name, name, self.intl):
                 return e
             blk = e.hash_chain
@@ -426,7 +485,11 @@ class FFSVolume:
         e = self.resolve(path)
         if not e.is_dir():
             raise FSError("not a directory: %s" % path)
-        return self._list_entries(e.blk)
+        entries = self._list_entries(e.blk)
+        if self.is_longname:
+            for ent in entries:
+                self._fill_comment(ent)
+        return entries
 
     def _list_entries(self, dir_blk, sort=True):
         buf = self.read_buf(dir_blk)
@@ -439,7 +502,7 @@ class FFSVolume:
                 if guard > MAX_CHAIN:
                     raise FSError("cyclic hash chain in dir block %d" % dir_blk)
                 ebuf = self.read_buf(blk)
-                e = Entry.parse(ebuf, blk)
+                e = Entry.parse(ebuf, blk, self.is_longname)
                 entries.append(e)
                 blk = e.hash_chain
         if sort:
@@ -466,7 +529,7 @@ class FFSVolume:
         """Return an iterator over the file's data chunks."""
         e = self.resolve(path) if not isinstance(path, Entry) else path
         if e.sec_type == ST_LINKFILE and e.real_entry:
-            e = Entry.parse(self.read_buf(e.real_entry), e.real_entry)
+            e = Entry.parse(self.read_buf(e.real_entry), e.real_entry, self.is_longname)
         if not e.is_file():
             raise FSError("not a file: %s" % e.name_str())
         return self._read_data(e)
@@ -520,17 +583,25 @@ class FFSVolume:
         root.fix_checksum()
         self.write_buf(self.root_blk, root)
 
+    def _date_loc(self, blk):
+        """Longword index of an entry's modification date. On LNFS volumes
+        the date moved to -15 because -23 sits inside the combined
+        name+comment field; the root block keeps the classic layout."""
+        if self.is_longname and blk != self.root_blk:
+            return -15
+        return -23
+
     def _touch_dir(self, dir_blk):
         buf = self.read_buf(dir_blk)
-        self._now_stamp(buf, -23)
+        self._now_stamp(buf, self._date_loc(dir_blk))
         buf.fix_checksum()
         self.write_buf(dir_blk, buf)
 
     @staticmethod
-    def _check_name(name):
+    def _check_name(name, limit=MAX_NAME):
         if isinstance(name, str):
-            name = name.encode("latin-1")
-        if not 1 <= len(name) <= MAX_NAME:
+            name = name.encode("latin-1", errors="replace")
+        if not 1 <= len(name) <= limit:
             raise FSError("invalid name length: %r" % name)
         if b":" in name or b"/" in name or any(c < 32 for c in name):
             raise FSError("invalid characters in name: %r" % name)
@@ -548,7 +619,7 @@ class FFSVolume:
         parts = self._split(path)
         if not parts:
             raise FSError("empty path")
-        name = self._check_name(parts[-1])
+        name = self._check_name(parts[-1], self.max_name_len)
         parent_path = b"/".join(parts[:-1])
         parent = self.resolve(parent_path)
         if not parent.is_dir():
@@ -567,7 +638,7 @@ class FFSVolume:
             if guard > MAX_CHAIN:
                 raise FSError("cyclic hash chain")
             chain.append(blk)
-            blk = Entry.parse(self.read_buf(blk), blk).hash_chain
+            blk = Entry.parse(self.read_buf(blk), blk, self.is_longname).hash_chain
         # insertion point: keep chain sorted ascending by block number
         pos = 0
         while pos < len(chain) and chain[pos] < new_blk:
@@ -579,7 +650,7 @@ class FFSVolume:
         self.write_buf(new_blk, nbuf)
         if pos == 0:
             dbuf.put_long(6 + h, new_blk)
-            self._now_stamp(dbuf, -23)
+            self._now_stamp(dbuf, self._date_loc(dir_blk))
             dbuf.fix_checksum()
             self.write_buf(dir_blk, dbuf)
         else:
@@ -603,12 +674,12 @@ class FFSVolume:
             if guard > MAX_CHAIN:
                 raise FSError("cyclic hash chain")
             prev = blk
-            blk = Entry.parse(self.read_buf(blk), blk).hash_chain
+            blk = Entry.parse(self.read_buf(blk), blk, self.is_longname).hash_chain
         if blk != entry.blk:
             raise FSError("entry %s not found in parent chain" % entry.name_str())
         if prev is None:
             dbuf.put_long(6 + h, entry.hash_chain)
-            self._now_stamp(dbuf, -23)
+            self._now_stamp(dbuf, self._date_loc(dir_blk))
             dbuf.fix_checksum()
             self.write_buf(dir_blk, dbuf)
         else:
@@ -625,9 +696,35 @@ class FFSVolume:
         buf.put_slong(-1, sec_type)
         buf.put_long(-3, parent_blk)
         buf.put_long(-48, protect)
-        buf.put_bstr(self.bs - 80, MAX_NAME, name)
-        buf.put_bstr(self.bs - 184, MAX_COMMENT, comment)
-        self._now_stamp(buf, -23)
+        
+        if self.is_longname:
+            comment = comment[:MAX_COMMENT]
+            nac = bytearray(112)
+            nac[0] = len(name)
+            nac[1 : 1 + len(name)] = name
+            c_offset = 1 + len(name)
+            if comment and 2 + len(name) + len(comment) > 112:
+                # comment does not fit inline: store it in a T_COMMENT block
+                nac[c_offset] = 0
+                (cblk,) = self.bitmap.alloc(1)
+                cbuf = BlockBuf(None, self.bs)
+                cbuf.put_long(0, T_COMMENT)
+                cbuf.put_long(1, cblk)
+                cbuf.put_long(2, blk)  # header_key of the owning entry
+                cbuf.put_bstr(24, MAX_COMMENT, comment)
+                cbuf.fix_checksum()
+                self.write_buf(cblk, cbuf)
+                buf.put_long(-18, cblk)
+            else:
+                nac[c_offset] = len(comment)
+                if comment:
+                    nac[c_offset + 1 : c_offset + 1 + len(comment)] = comment
+            buf.data[buf.bs - 184 : buf.bs - 72] = nac
+            self._now_stamp(buf, -15)
+        else:
+            buf.put_bstr(self.bs - 80, MAX_NAME, name)
+            buf.put_bstr(self.bs - 184, MAX_COMMENT, comment)
+            self._now_stamp(buf, -23)
         return buf
 
     # -- dircache (DOS\4/\5) maintenance -------------------------------------
@@ -750,11 +847,13 @@ class FFSVolume:
             if not existing.is_file():
                 raise FSError("exists and is not a file: %s" % path)
             self.delete(existing)
-            parent = Entry.parse(self.read_buf(parent.blk), parent.blk)
+            parent = Entry.parse(self.read_buf(parent.blk), parent.blk, self.is_longname)
 
         if size is None:
             size = len(data)
-            
+        if size >= 1 << 32:
+            raise FSError("files >= 4 GB not supported (byte_size is 32-bit)")
+
         data_bytes = self.bs if self.ffs else self.bs - 24
         ndata = (size + data_bytes - 1) // data_bytes
         next_ext = max(0, ndata - self.tsz)
@@ -830,7 +929,7 @@ class FFSVolume:
             # file header
             buf = self._new_header(hdr_blk, ST_FILE, parent.blk, name, protect, comment)
             if mtime is not None:
-                self._now_stamp(buf, -23, mtime)
+                self._now_stamp(buf, self._date_loc(hdr_blk), mtime)
             head = data_blks[: self.tsz]
             buf.put_long(2, len(head))
             buf.put_long(4, data_blks[0] if data_blks else 0)
@@ -855,6 +954,8 @@ class FFSVolume:
     def _entry_blocks(self, entry):
         """All blocks belonging to a file/link header (header, exts, data)."""
         blocks = [entry.blk]
+        if getattr(entry, "comment_block", 0):
+            blocks.append(entry.comment_block)
         if entry.sec_type in (ST_SOFTLINK, ST_LINKFILE, ST_LINKDIR):
             return blocks
         if entry.sec_type == ST_USERDIR:
@@ -890,7 +991,7 @@ class FFSVolume:
             for child in children:
                 self.delete(child, recursive=True)
             # re-read: child deletions touched this dir block
-            entry = Entry.parse(self.read_buf(entry.blk), entry.blk)
+            entry = Entry.parse(self.read_buf(entry.blk), entry.blk, self.is_longname)
         self._unlink_entry(entry)
         self.bitmap.free(self._entry_blocks(entry))
         self._update_dircache(entry.parent)
@@ -913,10 +1014,40 @@ class FFSVolume:
             while p and p != self.root_blk:
                 if p == entry.blk:
                     raise FSError("cannot move a directory into itself")
-                p = Entry.parse(self.read_buf(p), p).parent
+                p = Entry.parse(self.read_buf(p), p, self.is_longname).parent
         self._unlink_entry(entry)
         buf = self.read_buf(entry.blk)
-        buf.put_bstr(self.bs - 80, MAX_NAME, new_name)
+        if self.is_longname:
+            nac = buf.data[buf.bs - 184 : buf.bs - 72]
+            name_len = nac[0]
+            comment_len = nac[name_len + 1]
+            comment = nac[name_len + 2 : name_len + 2 + comment_len] if comment_len > 0 else b""
+
+            new_nac = bytearray(112)
+            new_nac[0] = len(new_name)
+            new_nac[1 : 1 + len(new_name)] = new_name
+            c_offset = 1 + len(new_name)
+            if comment and 2 + len(new_name) + len(comment) > 112:
+                # the longer name pushed the inline comment out: move it
+                # to a T_COMMENT block (an existing block ptr is kept as-is)
+                new_nac[c_offset] = 0
+                (cblk,) = self.bitmap.alloc(1)
+                cbuf = BlockBuf(None, self.bs)
+                cbuf.put_long(0, T_COMMENT)
+                cbuf.put_long(1, cblk)
+                cbuf.put_long(2, entry.blk)
+                cbuf.put_bstr(24, MAX_COMMENT, bytes(comment))
+                cbuf.fix_checksum()
+                self.write_buf(cblk, cbuf)
+                buf.put_long(-18, cblk)
+                self.bitmap.flush()
+            else:
+                new_nac[c_offset] = len(comment)
+                if len(comment) > 0:
+                    new_nac[c_offset + 1 : c_offset + 1 + len(comment)] = comment
+            buf.data[buf.bs - 184 : buf.bs - 72] = new_nac
+        else:
+            buf.put_bstr(self.bs - 80, MAX_NAME, new_name)
         buf.put_long(-3, new_parent.blk)
         buf.fix_checksum()
         self.write_buf(entry.blk, buf)
@@ -937,13 +1068,15 @@ class FFSVolume:
         if self.dos_type is None or (self.dos_type >> 8) != 0x444F53:
             raise FSError("dos_type required (e.g. 0x444F5303 for DOS\\3)")
         flavor = self.dos_type & 0xFF
-        if flavor > 5:
+        if flavor > 7:
             raise FSError("cannot format DOS\\%d volumes" % flavor)
         self.ffs = bool(flavor & 1)
         self.intl = flavor >= 2
         self.dircache = flavor in (4, 5)
+        self.is_longname = flavor in (6, 7)
+        self.max_name_len = 107 if self.is_longname else MAX_NAME
         self.read_only = False
-        label = self._check_name(label)
+        label = self._check_name(label)  # volume labels stay <= 30 chars
         if self.total - self.reserved < 8:
             raise FSError("volume too small")
 
@@ -1057,12 +1190,16 @@ class FFSVolume:
         used, problems = self.collect_used_blocks()
         wrong_free = []   # used by tree but marked free (dangerous)
         wrong_used = []   # marked used but unreachable (lost blocks)
-        for blk in range(self.reserved, self.total):
-            free = self.bitmap.is_free(blk)
-            if blk in used and free:
-                wrong_free.append(blk)
-            elif blk not in used and not free:
-                wrong_used.append(blk)
+        for pi, actual, expect, base_idx, limit in self._bitmap_page_diffs(used):
+            for off in range(limit):
+                w, b = divmod(off, 32)
+                byte = w * 4 + (3 - b // 8)
+                a = (actual[byte] >> (b % 8)) & 1
+                e = (expect[byte] >> (b % 8)) & 1
+                if a == e:
+                    continue
+                blk = self.reserved + base_idx + off
+                (wrong_free if e == 0 else wrong_used).append(blk)
         report = {
             "used_blocks": len(used),
             "alloc_missing": len(wrong_free),
@@ -1083,6 +1220,35 @@ class FFSVolume:
             self.write_buf(self.root_blk, root)
             report["applied"] = True
         return report
+
+    def _bitmap_page_diffs(self, used):
+        """Yield (page_idx, actual, expected, base_bit_idx, valid_bits) for
+        bitmap pages that differ from the state implied by `used`.
+
+        The expected free-bitmap is built once (bit set = free, cleared for
+        every tree-reachable block) so page comparison runs at bytes-compare
+        speed; only damaged pages are examined bit by bit by the caller.
+        """
+        page_bytes = self.bs - 4
+        bpp = self.bitmap.bits_per_page
+        npages = len(self.bitmap.pages)
+        expected = bytearray(b"\xff" * (npages * page_bytes))
+        valid = self.total - self.reserved
+        for blk in used:
+            idx = blk - self.reserved
+            if 0 <= idx < valid:
+                w, b = divmod(idx, 32)
+                expected[w * 4 + (3 - b // 8)] &= ~(1 << (b % 8)) & 0xFF
+        for pi in range(npages):
+            actual = bytes(self.bitmap.pages[pi].data[4 : 4 + page_bytes])
+            expect = bytes(expected[pi * page_bytes : (pi + 1) * page_bytes])
+            base_idx = pi * bpp
+            limit = min(bpp, valid - base_idx)
+            if limit <= 0:
+                break
+            if limit == bpp and actual == expect:
+                continue  # clean full page: nothing to look at
+            yield pi, actual, expect, base_idx, limit
 
     # -- verification --------------------------------------------------------
     def check(self, deep=False):
@@ -1129,6 +1295,11 @@ class FFSVolume:
                 continue
             if e.type != T_HEADER:
                 errors.append("%s: bad primary type %d" % (path, e.type))
+            if self.is_longname and getattr(e, "comment_block", 0):
+                cbuf = self.read_buf(e.comment_block)
+                if cbuf.long(0) != T_COMMENT or not cbuf.checksum_ok():
+                    errors.append("%s: bad comment block %d" % (path, e.comment_block))
+                mark(e.comment_block, path + " (comment)")
             if e.sec_type == ST_USERDIR:
                 n_dirs += 1
                 mark(e.blk, path)
@@ -1231,18 +1402,30 @@ class FFSVolume:
                         % (dpath, len(records), len(actual))
                     )
 
-        # bitmap consistency
+        # bitmap consistency: compare whole pages at memcmp speed and only
+        # drill into individual bits where a page actually differs -- a
+        # per-block Python loop takes ~10s on a 10 GB volume
         lost = shared = 0
-        for blk in range(self.reserved, self.total):
-            free = self.bitmap.is_free(blk)
-            if blk in used and free:
-                errors.append("block %d in use by %s but marked free" % (blk, used[blk]))
-                shared += 1
-                if shared > 20:
-                    errors.append("... more bitmap errors suppressed")
-                    break
-            elif blk not in used and not free:
-                lost += 1
+        for pi, actual, expect, base_idx, limit in self._bitmap_page_diffs(used):
+            for off in range(limit):
+                w, b = divmod(off, 32)
+                byte = w * 4 + (3 - b // 8)
+                a = (actual[byte] >> (b % 8)) & 1
+                e = (expect[byte] >> (b % 8)) & 1
+                if a == e:
+                    continue
+                blk = self.reserved + base_idx + off
+                if e == 0:  # in use by the tree but marked free
+                    if shared <= 20:
+                        errors.append(
+                            "block %d in use by %s but marked free"
+                            % (blk, used.get(blk, "?"))
+                        )
+                    shared += 1
+                else:
+                    lost += 1
+        if shared > 20:
+            errors.append("... more bitmap errors suppressed")
         if lost:
             warnings.append("%d allocated blocks not reachable from the tree" % lost)
 
