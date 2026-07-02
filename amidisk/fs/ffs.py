@@ -740,8 +740,8 @@ class FFSVolume:
                     raise
                 self.mkdir(cur)
 
-    def write_file(self, path, data, protect=0, comment=b"", mtime=None):
-        """Create or replace a file with `data` (bytes)."""
+    def write_file(self, path, data, size=None, protect=0, comment=b"", mtime=None):
+        """Create or replace a file with `data` (bytes or iterator of bytes)."""
         self._require_writable()
         parent, name = self._resolve_parent(path)
         pbuf = self.read_buf(parent.blk)
@@ -752,63 +752,99 @@ class FFSVolume:
             self.delete(existing)
             parent = Entry.parse(self.read_buf(parent.blk), parent.blk)
 
+        if size is None:
+            size = len(data)
+            
         data_bytes = self.bs if self.ffs else self.bs - 24
-        ndata = (len(data) + data_bytes - 1) // data_bytes
-        next = max(0, ndata - self.tsz)
-        next_blocks = (next + self.tsz - 1) // self.tsz
+        ndata = (size + data_bytes - 1) // data_bytes
+        next_ext = max(0, ndata - self.tsz)
+        next_blocks = (next_ext + self.tsz - 1) // self.tsz
         blocks = self.bitmap.alloc(1 + ndata + next_blocks)
         hdr_blk = blocks[0]
         data_blks = blocks[1 : 1 + ndata]
         ext_blks = blocks[1 + ndata :]
 
-        # data blocks
-        for i, blk in enumerate(data_blks):
-            chunk = data[i * data_bytes : (i + 1) * data_bytes]
-            if self.ffs:
-                payload = bytes(chunk).ljust(self.bs, b"\x00")
-                self.dev.write(blk * self.spb, payload)
+        try:
+            # data blocks
+            if isinstance(data, bytes):
+                for i, blk in enumerate(data_blks):
+                    chunk = data[i * data_bytes : (i + 1) * data_bytes]
+                    if self.ffs:
+                        payload = bytes(chunk).ljust(self.bs, b"\x00")
+                        self.dev.write(blk * self.spb, payload)
+                    else:
+                        buf = BlockBuf(None, self.bs)
+                        buf.put_long(0, T_DATA)
+                        buf.put_long(1, hdr_blk)
+                        buf.put_long(2, i + 1)                     # sequence number
+                        buf.put_long(3, len(chunk))
+                        buf.put_long(4, data_blks[i + 1] if i + 1 < ndata else 0)
+                        buf.data[24 : 24 + len(chunk)] = chunk
+                        buf.fix_checksum()
+                        self.write_buf(blk, buf)
             else:
+                iterator = iter(data)
+                buf_stream = bytearray()
+                for i, blk in enumerate(data_blks):
+                    chunk_len = min(data_bytes, size - i * data_bytes)
+                    while len(buf_stream) < chunk_len:
+                        try:
+                            buf_stream += next(iterator)
+                        except StopIteration:
+                            raise FSError("stream ended prematurely")
+                    chunk = bytes(buf_stream[:chunk_len])
+                    buf_stream = buf_stream[chunk_len:]
+                    
+                    if self.ffs:
+                        payload = chunk.ljust(self.bs, b"\x00")
+                        self.dev.write(blk * self.spb, payload)
+                    else:
+                        buf = BlockBuf(None, self.bs)
+                        buf.put_long(0, T_DATA)
+                        buf.put_long(1, hdr_blk)
+                        buf.put_long(2, i + 1)
+                        buf.put_long(3, len(chunk))
+                        buf.put_long(4, data_blks[i + 1] if i + 1 < ndata else 0)
+                        buf.data[24 : 24 + len(chunk)] = chunk
+                        buf.fix_checksum()
+                        self.write_buf(blk, buf)
+                        
+            # extension blocks (written last-to-first to know the next pointer)
+            next_ext_ptr = 0
+            for x in range(next_blocks - 1, -1, -1):
+                blk = ext_blks[x]
+                part = data_blks[self.tsz * (x + 1) : self.tsz * (x + 2)]
                 buf = BlockBuf(None, self.bs)
-                buf.put_long(0, T_DATA)
-                buf.put_long(1, hdr_blk)
-                buf.put_long(2, i + 1)                     # sequence number
-                buf.put_long(3, len(chunk))
-                buf.put_long(4, data_blks[i + 1] if i + 1 < ndata else 0)
-                buf.data[24 : 24 + len(chunk)] = chunk
+                buf.put_long(0, T_LIST)
+                buf.put_long(1, blk)
+                buf.put_long(2, len(part))
+                for k, p in enumerate(part):
+                    buf.put_long(6 + self.tsz - 1 - k, p)
+                buf.put_long(-3, hdr_blk)
+                buf.put_long(-2, next_ext_ptr)
+                buf.put_slong(-1, ST_FILE)
                 buf.fix_checksum()
                 self.write_buf(blk, buf)
+                next_ext_ptr = blk
 
-        # extension blocks (written last-to-first to know the next pointer)
-        next_ext = 0
-        for x in range(next_blocks - 1, -1, -1):
-            blk = ext_blks[x]
-            part = data_blks[self.tsz * (x + 1) : self.tsz * (x + 2)]
-            buf = BlockBuf(None, self.bs)
-            buf.put_long(0, T_LIST)
-            buf.put_long(1, blk)
-            buf.put_long(2, len(part))
-            for k, p in enumerate(part):
+            # file header
+            buf = self._new_header(hdr_blk, ST_FILE, parent.blk, name, protect, comment)
+            if mtime is not None:
+                self._now_stamp(buf, -23, mtime)
+            head = data_blks[: self.tsz]
+            buf.put_long(2, len(head))
+            buf.put_long(4, data_blks[0] if data_blks else 0)
+            for k, p in enumerate(head):
                 buf.put_long(6 + self.tsz - 1 - k, p)
-            buf.put_long(-3, hdr_blk)
-            buf.put_long(-2, next_ext)
-            buf.put_slong(-1, ST_FILE)
+            buf.put_long(-47, size)
+            buf.put_long(-2, next_ext_ptr)
             buf.fix_checksum()
-            self.write_buf(blk, buf)
-            next_ext = blk
-
-        # file header
-        buf = self._new_header(hdr_blk, ST_FILE, parent.blk, name, protect, comment)
-        if mtime is not None:
-            self._now_stamp(buf, -23, mtime)
-        head = data_blks[: self.tsz]
-        buf.put_long(2, len(head))
-        buf.put_long(4, data_blks[0] if data_blks else 0)
-        for k, p in enumerate(head):
-            buf.put_long(6 + self.tsz - 1 - k, p)
-        buf.put_long(-47, len(data))
-        buf.put_long(-2, next_ext)
-        buf.fix_checksum()
-        self.write_buf(hdr_blk, buf)
+            self.write_buf(hdr_blk, buf)
+            
+        except Exception:
+            self.bitmap.free(blocks)
+            self.bitmap.flush()
+            raise
 
         self._link_entry(parent.blk, hdr_blk, name)
         self._update_dircache(parent.blk)

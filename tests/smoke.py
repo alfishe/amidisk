@@ -282,6 +282,57 @@ def test_cli(tmp):
     check("create/put/ls/extract/mv/rm/check", t)
 
 
+def test_streaming(tmp):
+    print("== streaming operations")
+    src_hdf = os.path.join(tmp, "src_stream.hdf")
+    dst_hdf = os.path.join(tmp, "dst_stream.hdf")
+    payload = os.path.join(tmp, "stream_payload.bin")
+    
+    with open(payload, "wb") as fh:
+        fh.write(os.urandom(200_000))
+        
+    def run(*args):
+        r = subprocess.run(
+            [sys.executable, "-m", "amidisk.cli", *args],
+            capture_output=True, text=True, cwd=ROOT,
+        )
+        if r.returncode != 0:
+            raise AssertionError("cli %s failed: %s" % (args[0], r.stderr.strip()))
+        return r.stdout
+
+    def t():
+        run("create", src_hdf, "--format", "Src", "--dostype", "ffs", "--size", "1M")
+        run("create", dst_hdf, "--format", "Dst", "--dostype", "ffs-intl", "--size", "1M")
+        
+        run("put", src_hdf, payload, "file.bin")
+        out = run("cp", src_hdf, "file.bin", dst_hdf, "copied.bin", "--checksum")
+        assert "md5:" in out
+        
+        out_file = os.path.join(tmp, "verify.bin")
+        run("extract", dst_hdf, "copied.bin", out_file)
+        
+        assert open(out_file, "rb").read() == open(payload, "rb").read()
+
+    check("stream copy with checksum between images", t)
+    
+    sfs_real = os.path.join(TESTDATA, "sfs-real.hdf")
+    if os.path.exists(sfs_real):
+        def t_sfs_stream():
+            # Create a destination image to stream into
+            run("create", dst_hdf, "--format", "Dst", "--dostype", "ffs", "--size", "1M", "--force")
+            
+            sfs_file = "Prefs/Env-Archive/deficons.prefs"
+            run("cp", sfs_real, sfs_file, dst_hdf, "streamed.prefs", "--checksum")
+            
+            # verify
+            out_file = os.path.join(tmp, "verify_sfs.bin")
+            run("extract", dst_hdf, "streamed.prefs", out_file)
+            run("extract", sfs_real, sfs_file, os.path.join(tmp, "sfs_orig.bin"))
+            assert open(out_file, "rb").read() == open(os.path.join(tmp, "sfs_orig.bin"), "rb").read()
+            
+        check("stream copy from SFS image", t_sfs_stream)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="amidisk-test-")
     try:
@@ -292,6 +343,7 @@ def main():
         test_repair(tmp)
         test_rescue(tmp)
         test_cli(tmp)
+        test_streaming(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("\n%d passed, %d failed, %d skipped" % (PASS, FAIL, SKIP))

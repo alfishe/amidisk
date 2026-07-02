@@ -6,9 +6,11 @@ Single-volume images (ADF, bare HDF) may omit the volume prefix.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
+import time
 from datetime import datetime
 
 from .image import open_image, ImageError
@@ -159,6 +161,88 @@ def cmd_extract(args):
             elif e.is_link():
                 print("skipping link: %s/%s" % (prefix, e.name_str()), file=sys.stderr)
         print("extracted %d files to %s" % (count, dest))
+    return 0
+
+
+# ---------------------------------------------------------------- cp
+class ChecksumStream:
+    def __init__(self, iterator):
+        self.iterator = iterator
+        self.md5 = hashlib.md5()
+        
+    def __iter__(self):
+        return self
+        
+    def __next__(self):
+        try:
+            chunk = next(self.iterator)
+            self.md5.update(chunk)
+            return chunk
+        except StopIteration:
+            raise
+
+def cmd_cp(args):
+    with open_image(args.src_image) as src_img, open_image(args.dst_image, writable=True) as dst_img:
+        src_vol_ref, src_path = src_img.parse_path(args.src_path)
+        dst_vol_ref, dst_path = dst_img.parse_path(args.dst_path)
+        
+        src_vol = src_vol_ref.mount()
+        dst_vol = dst_vol_ref.mount()
+        
+        start_time = time.time()
+        total_bytes = 0
+        file_count = 0
+        
+        entry = src_vol.resolve(src_path)
+        if entry.is_file():
+            try:
+                if dst_vol.resolve(dst_path).is_dir():
+                    dst_path = dst_path.rstrip("/") + "/" + entry.name_str()
+            except FSError:
+                pass
+            
+            stream = src_vol.read_file(entry)
+            chk_stream = ChecksumStream(stream) if args.checksum else stream
+            
+            dst_vol.write_file(dst_path, chk_stream, size=entry.size, protect=entry.protect, mtime=entry.mtime())
+            total_bytes += entry.size
+            file_count += 1
+            if args.checksum:
+                print(f"copied {dst_path} (md5: {chk_stream.md5.hexdigest()})")
+            else:
+                print(f"copied {dst_path}")
+            return 0
+            
+        if not args.recursive:
+            print(f"error: {src_path} is a directory (use -r)", file=sys.stderr)
+            return 1
+            
+        base_prefix = "/".join(p.decode("latin-1") for p in src_vol._split(src_path))
+        base_dest = dst_path.rstrip("/")
+        
+        for prefix, e in src_vol.walk(src_path):
+            rel = prefix[len(base_prefix):].lstrip("/") if base_prefix else prefix
+            amiga_dir = base_dest + ("/" + rel if rel else "") if base_dest else rel
+            
+            if e.is_dir():
+                dst_dir = amiga_dir + "/" + e.name_str() if amiga_dir else e.name_str()
+                dst_vol.makedirs(dst_dir)
+            elif e.is_file():
+                if amiga_dir:
+                    dst_vol.makedirs(amiga_dir)
+                dst_file = amiga_dir + "/" + e.name_str() if amiga_dir else e.name_str()
+                
+                stream = src_vol.read_file(e)
+                chk_stream = ChecksumStream(stream) if args.checksum else stream
+                
+                dst_vol.write_file(dst_file, chk_stream, size=e.size, protect=e.protect, mtime=e.mtime())
+                total_bytes += e.size
+                file_count += 1
+                if args.checksum:
+                    print(f"copied {dst_file} (md5: {chk_stream.md5.hexdigest()})")
+                
+        elapsed = time.time() - start_time
+        print(f"copied {file_count} files, {total_bytes} bytes in {elapsed:.4f} seconds")
     return 0
 
 
@@ -712,6 +796,44 @@ def cmd_fs_extract(args):
     return 0
 
 
+def cmd_bench(args):
+    with open_image(args.image) as img:
+        vol_ref, path = img.parse_path(args.path)
+        vol = vol_ref.mount()
+        
+        start_time = time.time()
+        total_bytes = 0
+        file_count = 0
+        
+        print(f"Benchmarking read on {vol.get_info()['label']}...")
+        
+        for prefix, e in vol.walk(path):
+            if e.is_file():
+                if args.filter and args.filter not in e.name_str():
+                    continue
+                    
+                if args.limit_files and file_count >= args.limit_files:
+                    break
+                    
+                try:
+                    for chunk in vol.read_file(e):
+                        total_bytes += len(chunk)
+                        if args.limit_bytes and total_bytes >= args.limit_bytes:
+                            break
+                except Exception as exc:
+                    print(f"error reading {prefix}/{e.name_str()}: {exc}", file=sys.stderr)
+                    
+                file_count += 1
+                if args.limit_bytes and total_bytes >= args.limit_bytes:
+                    break
+                    
+        elapsed = time.time() - start_time
+        print(f"Read {file_count} files, {total_bytes} bytes in {elapsed:.4f} seconds.")
+        if elapsed > 0:
+            print(f"Throughput: {total_bytes / elapsed / 1024 / 1024:.2f} MB/s")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="amidisk",
@@ -723,6 +845,14 @@ def main(argv=None):
     p.add_argument("image")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_info)
+
+    p = sub.add_parser("bench", help="benchmark file read operations")
+    p.add_argument("image")
+    p.add_argument("path", nargs="?", default="")
+    p.add_argument("--limit-files", type=int, help="max files to read")
+    p.add_argument("--limit-bytes", type=int, help="max bytes to read")
+    p.add_argument("--filter", help="substring filter for file names")
+    p.set_defaults(func=cmd_bench)
 
     p = sub.add_parser("ls", help="list a directory (VOL:Path)")
     p.add_argument("image")
@@ -750,6 +880,15 @@ def main(argv=None):
     p.add_argument("--comment")
     p.add_argument("--protect", help="e.g. 'hsparwed' subset like '----rwed'")
     p.set_defaults(func=cmd_put)
+
+    p = sub.add_parser("cp", help="copy files between images (streaming)")
+    p.add_argument("src_image")
+    p.add_argument("src_path")
+    p.add_argument("dst_image")
+    p.add_argument("dst_path")
+    p.add_argument("-r", "--recursive", action="store_true")
+    p.add_argument("--checksum", action="store_true", help="calculate MD5 checksum while copying")
+    p.set_defaults(func=cmd_cp)
 
     p = sub.add_parser("mkdir", help="create a directory")
     p.add_argument("image")
