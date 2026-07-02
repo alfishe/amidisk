@@ -24,10 +24,12 @@ For a bootblock to be recognized by the Amiga ROM, it must be exactly 1024 bytes
 ## Checksum Calculation Algorithm
 The Amiga bootblock checksum uses an **additive carry wraparound sum** (often referred to as 1's complement addition) to ensure data integrity. 
 
+Conceptually, the algorithm works like this: you sum up all the 1020 bytes of the block (skipping the 4 bytes reserved for the checksum itself). Then, you take the **bitwise complement** (inversion) of that sum and inject it into the checksum field. Because of the nature of binary addition, any number `X` added to its exact inverse `~X` naturally produces a solid block of `1`s (`0xFFFFFFFF`).
+
 To calculate and inject the correct checksum:
-1. **Initialize**: Set the 32-bit checksum field at offset `0x04` to `0`.
+1. **Initialize**: Set the 32-bit checksum field at offset `0x04` to `0` (or simply skip this offset in your loop).
 2. **Summation**: Treat the entire 1024-byte bootblock as an array of 256 big-endian 32-bit integers (longwords). Initialize a 64-bit accumulator to `0`.
-3. **Carry Wraparound**: Loop through all 256 longwords and add them to the accumulator. Whenever the accumulator exceeds `0xFFFFFFFF` (meaning a 32-bit carry occurred), add the carry bit back into the least significant bit.
+3. **Carry Wraparound**: Loop through the longwords and add them to the accumulator. Whenever the accumulator exceeds `0xFFFFFFFF` (meaning a 32-bit carry occurred), add the carry bit back into the least significant bit.
    ```python
    # Example Python implementation
    acc = 0
@@ -39,7 +41,7 @@ To calculate and inject the correct checksum:
        if acc > 0xFFFFFFFF:
            acc = (acc & 0xFFFFFFFF) + 1
    ```
-4. **Finalize**: The final checksum to be stored at offset `0x04` is the bitwise NOT (inversion) of the accumulated sum (`~acc & 0xFFFFFFFF`).
+4. **Complementary Fill**: The final checksum to be stored at offset `0x04` is the bitwise NOT (inversion) of the accumulated sum (`~acc & 0xFFFFFFFF`).
 
 ### The Proper Range
-The range of bytes controlled by the checksum is **exactly the first 1024 bytes** (offset `0` to `1023`) of the partition. Because the checksum is stored *inside* this block at offset `4`, you must either temporarily zero out offset `4` before summing the 1024 bytes, or explicitly skip the second longword (`i == 1`) during your calculation loop. When the Amiga ROM later verifies the bootblock, it simply sums the entire 1024 bytes (including your injected checksum field); the additive wraparound of `sum + ~sum` guarantees the result equals exactly `0xFFFFFFFF`.
+The range of bytes controlled by the checksum is **exactly the first 1024 bytes** (offset `0` to `1023`) of the partition. Because the checksum is stored *inside* this block at offset `4`, you must explicitly skip the second longword (`i == 1`) during your calculation loop. When the Amiga ROM later verifies the bootblock, it simply sums the entire 1024 bytes (including your injected complementary checksum field); the additive wraparound of `sum + ~sum` guarantees the result equals exactly `0xFFFFFFFF`.
