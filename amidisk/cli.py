@@ -55,6 +55,14 @@ def cmd_info(args):
                         p["boot_pri"],
                     )
                 )
+                if "bb_chksum_match" in p:
+                    match = p["bb_chksum_match"]
+                    got = p["bb_got_chksum"]
+                    exp = p["bb_expected_chksum"]
+                    if match:
+                        print("      bootblock: OK (chksum: 0x%08X)" % got)
+                    else:
+                        print("      bootblock: INVALID (got: 0x%08X, expected: 0x%08X)" % (got, exp))
             if info["filesystems"]:
                 print("embedded filesystems:")
                 for f in info["filesystems"]:

@@ -68,7 +68,7 @@ class Partition:
 
     def get_info(self):
         e = self.dos_env
-        return {
+        info = {
             "num": self.num,
             "drv_name": self.drv_name,
             "dos_type": self.get_dos_type_str(),
@@ -86,6 +86,32 @@ class Partition:
             "max_transfer": e.max_transfer,
             "mask": e.mask,
         }
+        
+        # Verify bootblock checksum
+        try:
+            import struct
+            start_sec = e.start_sec()
+            # A standard bootblock is 1024 bytes (typically 2 x 512-byte sectors)
+            blocks_to_read = max(1, 1024 // self.blkdev.block_bytes)
+            raw = self.blkdev.read(start_sec, blocks_to_read)
+            if len(raw) >= 1024:
+                bb = raw[:1024]
+                acc = 0
+                for i in range(256):
+                    if i == 1:
+                        continue
+                    acc += struct.unpack_from(">I", bb, i * 4)[0]
+                    if acc > 0xFFFFFFFF:
+                        acc = (acc & 0xFFFFFFFF) + 1
+                expected_chksum = (~acc) & 0xFFFFFFFF
+                got_chksum = struct.unpack_from(">I", bb, 4)[0]
+                info["bb_chksum_match"] = (got_chksum == expected_chksum)
+                info["bb_got_chksum"] = got_chksum
+                info["bb_expected_chksum"] = expected_chksum
+        except Exception:
+            pass
+            
+        return info
 
 
 class FileSystem:
