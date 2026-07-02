@@ -21,6 +21,8 @@ sys.path.insert(0, ROOT)
 from amidisk import open_image                      # noqa: E402
 from amidisk.blkdev import ImageFileBlkDev          # noqa: E402
 from amidisk.fs.ffs import FFSVolume                # noqa: E402
+from amidisk.fs.pfs3 import PFS3Volume
+from amidisk.fs.sfs import SFSVolume
 from amidisk.rdb import RDisk                       # noqa: E402
 
 DATA = os.path.join(ROOT, "data")
@@ -333,6 +335,30 @@ def test_streaming(tmp):
         check("stream copy from SFS image", t_sfs_stream)
 
 
+def test_sfs_format(tmp):
+    print("== SFS format")
+    path = os.path.join(tmp, "sfs_format.hdf")
+    
+    def t():
+        with open(path, "wb") as fh:
+            fh.truncate(4 * 1024 * 1024)
+        dev = ImageFileBlkDev(path, read_only=False)
+        try:
+            vol = SFSVolume(dev)
+            vol.format("SFSTest")
+            info = vol.get_info()
+            assert info["filesystem"] == "SFS"
+            assert info["label"] == "SFSTest"
+            entries = vol.list_dir("")
+            assert len(entries) == 1
+            assert entries[0].name_str() == ".recycled"
+            assert entries[0].is_dir()
+        finally:
+            dev.close()
+            
+    check("format SFS and verify", t)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="amidisk-test-")
     try:
@@ -344,6 +370,7 @@ def main():
         test_rescue(tmp)
         test_cli(tmp)
         test_streaming(tmp)
+        test_sfs_format(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("\n%d passed, %d failed, %d skipped" % (PASS, FAIL, SKIP))
