@@ -372,6 +372,7 @@ DOS_TYPES = {  # accepted --dostype spellings
     "ofs-intl": 0x444F5302, "dos2": 0x444F5302,
     "ffs-intl": 0x444F5303, "dos3": 0x444F5303,
     "sfs": 0x53465300, "sfs0": 0x53465300,
+    "pfs3": 0x50465303,
 }
 
 
