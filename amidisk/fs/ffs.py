@@ -312,6 +312,79 @@ class Bitmap:
         self._cursor = blk
         return found
 
+    def alloc_runs(self, count):
+        """Like alloc() but returns [(start, length)] runs without
+        materializing a per-block list -- the write path works in runs."""
+        vol = self.vol
+        if count > self.count_free():
+            raise FSError(
+                "disk full: needed %d blocks, %d free" % (count, self.count_free())
+            )
+        runs = []
+        got = 0
+        rs = rn = 0
+
+        def close():
+            nonlocal rn
+            if rn:
+                runs.append((rs, rn))
+                rn = 0
+
+        start = self._cursor if vol.reserved <= self._cursor < vol.total else vol.reserved
+        blk = start
+        total = vol.total
+        wrapped = False
+        while got < count:
+            idx = blk - vol.reserved
+            if idx % 32 == 0 and blk + 32 <= total:
+                page, off = self._locate(blk)
+                buf = self.pages[page]
+                li = 1 + off // 32
+                word = buf.long(li)
+                if word == 0:
+                    close()
+                    blk += 32
+                    if wrapped and start <= blk:
+                        break
+                    continue
+                if word == 0xFFFFFFFF and got + 32 <= count:
+                    buf.put_long(li, 0)
+                    self.dirty.add(page)
+                    if self._free_count is not None:
+                        self._free_count -= 32
+                    if rn and rs + rn == blk:
+                        rn += 32
+                    else:
+                        close()
+                        rs, rn = blk, 32
+                    got += 32
+                    blk += 32
+                    continue
+            if blk >= total:
+                close()
+                blk = vol.reserved
+                wrapped = True
+            if wrapped and blk >= start:
+                close()
+                for s, n in runs:
+                    for b in range(s, s + n):
+                        self._set(b, True)
+                raise FSError("disk full: needed %d blocks" % count)
+            if self.is_free(blk):
+                self._set(blk, False)
+                if rn and rs + rn == blk:
+                    rn += 1
+                else:
+                    close()
+                    rs, rn = blk, 1
+                got += 1
+            else:
+                close()
+            blk += 1
+        close()
+        self._cursor = blk
+        return runs
+
     def free(self, blks):
         for b in blks:
             self._set(b, True)
