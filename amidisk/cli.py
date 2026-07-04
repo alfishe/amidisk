@@ -511,9 +511,13 @@ def cmd_put(args):
             base = path.rstrip("/")
             try:
                 start_time = time.time()
-                n_files, n_dirs, size = handler.stream_to_volume(
-                    vol, base, truncate_name, max_len, protect, comment
-                )
+                import contextlib as _ctxlib
+                bulk_ctx = (vol.bulk() if getattr(args, "bulk", False)
+                            and hasattr(vol, "bulk") else _ctxlib.nullcontext())
+                with bulk_ctx:
+                    n_files, n_dirs, size = handler.stream_to_volume(
+                        vol, base, truncate_name, max_len, protect, comment
+                    )
                 elapsed = time.time() - start_time
                 print_transfer_stats(n_files, n_dirs, size, elapsed)
                 return 0
