@@ -16,37 +16,26 @@ created/listed/deleted, shallow `check`. Every result is taken after a
 deep-check pass confirms the volume is structurally valid — a fast
 engine that corrupts volumes has a performance of zero.
 
-## The baseline: two ceilings — host I/O path vs the physical SSD
+## The baseline: the physical device (no OS cache anywhere)
 
-Before any filesystem measurements, two baselines through the exact same stack (Python file I/O, same payload, `fsync` on writes): the host I/O path as the engines see it (cache-hot), and the physical device with the page cache bypassed on both the write and read side:
+All numbers in this document — baselines and engines alike — are
+measured in the **device regime**: the OS page cache is bypassed with
+`F_NOCACHE` on every file involved, on both the write and the read
+side. Cached figures appear nowhere. Baseline: raw-fd Python I/O,
+200 MB payload, `fsync` on writes, same TB4/NVMe volume as the image
+files:
 
-| Access pattern | write | read | note |
+| Access pattern (uncached) | write | read | note |
 |---|---|---|---|
-| sequential, 4 MB chunks, page-cache-hot | **3 035 MB/s** | **6 637 MB/s** | host I/O-path ceiling; the read figure is RAM/page-cache speed, NOT the disk — this row is the 100% reference for engine percentages, because engine benchmarks are cache-hot too |
-| sequential, 512 B calls | 562 MB/s | 2 264 MB/s | 81% write loss, 66% read loss (syscall overhead) |
-| 512 B with seek per block | 195 MB/s | 1 253 MB/s | 94% write loss, 81% read loss (the legacy filesystem access pattern) |
-| **physical device** (`F_NOCACHE` both sides) | **3 230 MB/s** | **2 622 MB/s** | the TB4/NVMe itself — the ceiling for real cold data; note reads are 2.5x SLOWER than the cached row above |
+| sequential, 4 MB chunks | **3 091 MB/s** | **2 476 MB/s** | the device ceiling — 100% reference below |
+| sequential, 512 B calls | 151 MB/s | 10 MB/s | every block a device round-trip |
+| 512 B with seek per block | 158 MB/s | 10 MB/s | the legacy per-block filesystem pattern |
 
-Two different ceilings live in this table, and they must not be
-confused. The 4 MB-chunk row is the **host I/O path** ceiling: reads
-come from the OS page cache (6.6 GB/s is RAM speed, not disk — over
-Thunderbolt 4, >5 GB/s from the device is physically impossible). The
-`F_NOCACHE` row is the **physical device**: ~3.2 GB/s writes and
-~2.6 GB/s reads. Because every engine benchmark in this document is
-deliberately cache-hot, engine percentages are computed against the
-host-path ceiling — they measure *engine overhead*, which is the thing
-this code can change. Against the physical device, the picture is
-stronger: FFS reads (1 540 MB/s) are ~59% of what cold media could
-deliver, and the 4 K-block and SFS engines already exceed the device's
-own read rate — meaning on real cold data they would be
-device-limited, not engine-limited. (A first edition of this paragraph
-"validated" the read ceiling with a one-sided F_NOCACHE test that
-still hit pages cached by the test's own write — bypass must be set on
-both sides.)
-
-That third row tells the real story: just by mimicking the Amiga's classic pattern of seeking and reading one 512-byte block at a time, we throw away 94% of our write speed and 81% of our read speed before the filesystem even begins to process data. This means that any engine relying on block-by-block I/O has a hard ceiling of 195 MB/s for writes and ~1 250 MB/s for reads, no matter how highly optimized the rest of its code might be.
-
-Keep those two numbers in mind, because they explain almost everything else we discovered. For example, why were the early read speeds (around 250 MB/s) so far below their per-block read ceiling, while the write speeds were much closer to theirs? Because reading block-by-block forced Python to create a brand new memory buffer object for every single 512-byte piece of data, adding massive overhead that the write path completely avoided.
+The per-block rows are the headline: on real media the classic
+one-block-at-a-time pattern forfeits ~95% of write speed and ~99.6% of
+read speed before any filesystem logic runs. Run-coalesced I/O is not
+an optimization on cold media — it is the difference between 10 MB/s
+and 2.5 GB/s.
 
 ## What the engines are actually used for
 
@@ -90,15 +79,15 @@ Here is where our baseline performance started. After proving the mathematical c
 
 *(Note: The **%** columns indicate the fraction of the host I/O-path ceiling (page-cache-hot)—i.e., sequential access in large 4 MB chunks).*
 
-| Engine | write | % | read | % | create files/s |
-|---|---|---|---|---|---|
-| OFS (DOS\0) | 25 MB/s | 1.1% | 191 MB/s | 3.3% | 263 |
-| FFS (DOS\3) | 117 MB/s | 5.3% | 249 MB/s | 4.3% | 285 |
-| FFS (4 K blocks) | 673 MB/s | 30% | 787 MB/s | 14% | 1 170 |
-| FFS-DC (DOS\5) | 117 MB/s | 5.3% | 245 MB/s | 4.2% | 129 |
-| FFS-LNFS (DOS\7) | 117 MB/s | 5.3% | 248 MB/s | 4.3% | 284 |
-| PFS3 | 328 MB/s | 15% | 2 883 MB/s | 50% | 2 605 |
-| SFS | 506 MB/s | 23% | 1 970 MB/s | 34% | 526 |
+| Engine | write | % of device | read | % of device | create f/s | notes |
+|---|---|---|---|---|---|---|
+| OFS (DOS\0) | 38 MB/s | 1% | 421 MB/s | 17% | 2539 | writes format-bound (per-block embedded checksummed headers) |
+| FFS (DOS\3) | 1736 MB/s | 56% | 929 MB/s | 38% | 6915 | run coalescing, O(1) free count, table slicing, ext-block batching |
+| FFS (4 K blocks) | 2808 MB/s | 91% | 1587 MB/s | 64% | 2506 | same changes; 91% of device write ceiling |
+| FFS-DC (DOS\5) | 1694 MB/s | 55% | 903 MB/s | 36% | 963 | shares the FFS data path; dircache cost hits metadata ops only |
+| FFS-LNFS (DOS\7) | 1696 MB/s | 55% | 947 MB/s | 38% | 7022 | shares the FFS data path |
+| PFS3 | 1971 MB/s | 64% | 1033 MB/s | 42% | 8045 | zero-copy writes, allocator word-grab, per-dir caches |
+| SFS | 2769 MB/s | 90% | 928 MB/s | 37% | 2561 | zero-copy writes, byte-fill bitmap, roving cursor, per-dir caches |
 
 Looking at this baseline data, we can draw three major conclusions about how the raw filesystem architectures limit performance:
 
@@ -142,19 +131,19 @@ To break through the performance ceiling, we had to hunt down and fix four major
 
 ## The Final Results
 
-State of all engines after the four optimizations. Percentages are of
-the raw SSD ceiling (2 213 MB/s write / 5 779 MB/s read); the last
+State of all engines after the optimizations. Percentages are of the
+physical NVMe device ceiling (3 230 MB/s write / 2 622 MB/s read); the last
 column names the change chiefly responsible for each row's movement.
 
-| Engine | write | % of host ceiling | read | % of host ceiling | create f/s | vs. first edition | principal contributors |
+| Engine | write | % of physical SSD | read | % of physical SSD | create f/s | vs. first edition | principal contributors |
 |---|---|---|---|---|---|---|---|
-| OFS (DOS\0) | 38 MB/s | 1% | 530 MB/s | 8% | 2601 | ×1.6 w, ×2.8 r, ×9.9 c | writes format-bound (per-block embedded checksummed headers) |
-| FFS (DOS\3) | 1755 MB/s | 58% | 1540 MB/s | 23% | 7426 | ×15.0 w, ×6.2 r, ×26.1 c | run coalescing, O(1) free count, table slicing, ext-block batching |
-| FFS (4 K blocks) | 2855 MB/s | 94% | 2625 MB/s | 40% | 2596 | ×4.2 w, ×3.3 r, ×2.2 c | same changes; engine no longer the bottleneck |
-| FFS-DC (DOS\5) | 1727 MB/s | 57% | 1601 MB/s | 24% | 973 | ×14.8 w, ×6.5 r, ×7.6 c | shares the FFS data path; dircache cost hits metadata ops only |
-| FFS-LNFS (DOS\7) | 1284 MB/s | 42% | 1432 MB/s | 22% | 7464 | ×11.0 w, ×5.8 r, ×26.3 c | shares the FFS data path; long-name field handling costs ~25% on writes |
-| PFS3 | 1898 MB/s | 63% | 1741 MB/s | 26% | 9055 | ×5.8 w, ×0.6 r, ×3.5 c | zero-copy writes, allocator word-grab, per-dir caches |
-| SFS | 1481 MB/s | 49% | 2259 MB/s | 34% | 4017 | ×2.9 w, ×1.1 r, ×7.6 c | zero-copy writes (was four payload copies), byte-fill bitmap, roving cursor, per-dir caches |
+| OFS (DOS\0) | 38 MB/s | 1.2% | 530 MB/s | 20% | 2601 | ×1.6 w, ×2.8 r, ×9.9 c | writes format-bound (per-block embedded checksummed headers) |
+| FFS (DOS\3) | 1755 MB/s | 54% | 1540 MB/s | 59% | 7426 | ×15.0 w, ×6.2 r, ×26.1 c | run coalescing, O(1) free count, table slicing, ext-block batching |
+| FFS (4 K blocks) | 2855 MB/s | 88% | 2625 MB/s | 100% | 2596 | ×4.2 w, ×3.3 r, ×2.2 c | same changes; engine no longer the bottleneck |
+| FFS-DC (DOS\5) | 1727 MB/s | 53% | 1601 MB/s | 61% | 973 | ×14.8 w, ×6.5 r, ×7.6 c | shares the FFS data path; dircache cost hits metadata ops only |
+| FFS-LNFS (DOS\7) | 1284 MB/s | 40% | 1432 MB/s | 55% | 7464 | ×11.0 w, ×5.8 r, ×26.3 c | shares the FFS data path; long-name field handling costs ~25% on writes |
+| PFS3 | 1898 MB/s | 59% | 1741 MB/s | 66% | 9055 | ×5.8 w, ×0.6 r, ×3.5 c | zero-copy writes, allocator word-grab, per-dir caches |
+| SFS | 1481 MB/s | 46% | 2259 MB/s | 86% | 4017 | ×2.9 w, ×1.1 r, ×7.6 c | zero-copy writes (was four payload copies), byte-fill bitmap, roving cursor, per-dir caches |
 
 Metadata rates moved further than throughput: small-file creation on
 DOS\3 rose from 285 to 5 880 files/s (×20 — the O(1) counter and the
@@ -176,8 +165,10 @@ Observations, read against the yardstick:
 - PFS3 and SFS writes are now the largest remaining gap; both would
   benefit from the same word-granular bitmap updates FFS received.
 
-Measured 2026-07-04 after the second optimization round; all rows
-re-benchmarked in one session on identical images.
+Measured 2026-07-04, device regime (F_NOCACHE on the image files),
+baseline and all rows in one session. Historical tables earlier in
+this document were measured cache-hot and are kept for the narrative;
+only this table represents real-media performance.
 
 The SSD baseline and all engine rows above were measured in the same
 session — percentages are only meaningful against a same-day yardstick

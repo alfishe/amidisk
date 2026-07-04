@@ -46,12 +46,18 @@ class BlockDevice:
 class ImageFileBlkDev(BlockDevice):
     """Raw image file (HDF, ADF, .img): a flat array of sectors."""
 
-    def __init__(self, path, read_only=True, block_bytes=512):
+    def __init__(self, path, read_only=True, block_bytes=512, nocache=False):
         self.path = path
         self.read_only = read_only
         self.block_bytes = block_bytes
         mode = "rb" if read_only else "r+b"
         self.fh = open(path, mode)
+        if nocache:
+            # bypass the OS page cache (macOS F_NOCACHE): used by the
+            # benchmark suite to measure true device-regime performance
+            import fcntl
+            if hasattr(fcntl, "F_NOCACHE"):
+                fcntl.fcntl(self.fh.fileno(), fcntl.F_NOCACHE, 1)
         self.fh.seek(0, os.SEEK_END)
         self._size = self.fh.tell()
         self.num_blocks = self._size // block_bytes
