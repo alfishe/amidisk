@@ -21,18 +21,26 @@ from .blkdev import BlockDeviceError
 
 def print_progress(current_bytes, total_bytes, current_file=""):
     """Prints a dynamic, overwriting progress bar to stdout."""
-    percent = (current_bytes / total_bytes) * 100 if total_bytes > 0 else 0
+    # Self-tuning byte step based on total size:
+    # update at most ~500 times, but at least every 256 KB.
+    step = max(262144, total_bytes // 500)
+    last_bytes = getattr(print_progress, "_last_bytes", 0)
     
+    if current_bytes < total_bytes and (current_bytes - last_bytes < step):
+        return
+        
     import time
     now = time.time()
     last_t = getattr(print_progress, "_last_t", 0)
     
-    # Throttle: print at most every 250ms, or on completion
-    if current_bytes < total_bytes and (now - last_t < 0.25):
+    # Throttle: print at most every 200ms, or on completion
+    if current_bytes < total_bytes and (now - last_t < 0.20):
         return
         
     print_progress._last_t = now
+    print_progress._last_bytes = current_bytes
 
+    percent = (current_bytes / total_bytes) * 100 if total_bytes > 0 else 0
     bar_len = 30
     filled = int((percent / 100) * bar_len) if percent <= 100 else bar_len
     bar = '#' * filled + '-' * (bar_len - filled)
