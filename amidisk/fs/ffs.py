@@ -25,6 +25,8 @@ from .util import (
     hash_name,
     names_equal,
     protect_to_str,
+    UPPER_TABLE_INTL,
+    UPPER_TABLE_STD,
 )
 
 # primary block types
@@ -225,7 +227,7 @@ class Bitmap:
             if guard > MAX_CHAIN:
                 raise FSError("cyclic bitmap extension chain")
             ebuf = vol.read_buf(ext)
-            for i in range(vol.nl - 1):
+            for i in range(1, vol.nl - 1):
                 p = ebuf.long(i)
                 if p:
                     ptrs.append(p)
@@ -323,6 +325,9 @@ class Bitmap:
                 found.append(blk)
             blk += 1
         self._cursor = blk
+        for b in found:
+            if b < vol.reserved or b >= vol.total:
+                raise FSError(f"alloc returned invalid block: {b}, vol.reserved={vol.reserved}, vol.total={vol.total}, count={count}")
         return found
 
     def alloc_runs(self, count):
@@ -423,6 +428,9 @@ class Bitmap:
             blk += 1
         close()
         self._cursor = blk
+        for s, n in runs:
+            if s < vol.reserved or s + n > vol.total:
+                raise FSError(f"alloc_runs returned invalid run: {(s, n)}, vol.reserved={vol.reserved}, vol.total={vol.total}, count={count}")
         return runs
 
     def free(self, blks):
@@ -519,6 +527,7 @@ class FFSVolume:
             raise FSError("unsupported DOS type flavor %d" % flavor)
         self.ffs = bool(flavor & 1)
         self.intl = flavor >= 2
+        self._fold_table = UPPER_TABLE_INTL if self.intl else UPPER_TABLE_STD
         self.dircache = flavor in (4, 5)
         self.is_longname = flavor in (6, 7)
         self.max_name_len = 107 if self.is_longname else MAX_NAME
@@ -637,9 +646,7 @@ class FFSVolume:
         return names
 
     def _fold(self, name):
-        from .util import UPPER_TABLE_INTL, UPPER_TABLE_STD
-        table = UPPER_TABLE_INTL if self.intl else UPPER_TABLE_STD
-        return name.translate(table)
+        return name.translate(self._fold_table)
 
     def _find_in_dir(self, dir_buf, name):
         """Hash-chain lookup. Chain nodes are compared by extracting only
@@ -1596,6 +1603,7 @@ class FFSVolume:
             raise FSError("cannot format DOS\\%d volumes" % flavor)
         self.ffs = bool(flavor & 1)
         self.intl = flavor >= 2
+        self._fold_table = UPPER_TABLE_INTL if self.intl else UPPER_TABLE_STD
         self.dircache = flavor in (4, 5)
         self.is_longname = flavor in (6, 7)
         self.max_name_len = 107 if self.is_longname else MAX_NAME
@@ -1609,7 +1617,7 @@ class FFSVolume:
         npages = (self.total - self.reserved + bits_per_page - 1) // bits_per_page
         next_blocks = 0
         if npages > 25:
-            per_ext = self.nl - 1
+            per_ext = self.nl - 2
             next_blocks = (npages - 25 + per_ext - 1) // per_ext
         page_blks = [self.root_blk + 1 + i for i in range(npages)]
         ext_blks = [self.root_blk + 1 + npages + i for i in range(next_blocks)]
@@ -1646,11 +1654,12 @@ class FFSVolume:
         idx = 25
         for x, eblk in enumerate(ext_blks):
             ebuf = BlockBuf(None, self.bs)
-            for i in range(self.nl - 1):
+            for i in range(1, self.nl - 1):
                 if idx < npages:
                     ebuf.put_long(i, page_blks[idx])
                     idx += 1
             ebuf.put_long(self.nl - 1, ext_blks[x + 1] if x + 1 < next_blocks else 0)
+            ebuf.fix_checksum(0)
             self.dev.write(eblk * self.spb, bytes(ebuf.data))
 
         # root block
