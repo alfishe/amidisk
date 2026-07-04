@@ -25,14 +25,24 @@ Before any emulated filesystem-specific measurements, let's get an SSD performan
 | sequential, 4 MB chunks | **3 035 MB/s** | **6 637 MB/s** | the host ceiling — 100% below |
 | sequential, 512 B calls | 562 MB/s | 2 264 MB/s | 81% write loss, 66% read loss (syscall overhead) |
 | 512 B with seek per block | 195 MB/s | 1 253 MB/s | 94% write loss, 81% read loss (the legacy filesystem access pattern) |
-| device read, page cache bypassed (`F_NOCACHE`) | — | 6 383 MB/s | validates the read ceiling: this TB4/NVMe array genuinely sustains ~6.4 GB/s, so cache-hot numbers are not inflated |
+| physical device (`F_NOCACHE` both sides) | 3 230 MB/s | 2 622 MB/s | the TB4/NVMe itself — what real cold data can move at |
 
-A fair objection to the read ceiling: cache-hot reads measure RAM, not
-the SSD. The `F_NOCACHE` row answers it — on this hardware the device
-itself sustains 6.4 GB/s sequential reads, within 4% of the cached
-figure, so read percentages below are valid against the physical
-device too. (On a typical single NVMe stick at ~3 GB/s the same
-engines would rate roughly twice as high.)
+Two different ceilings live in this table, and they must not be
+confused. The 4 MB-chunk row is the **host I/O path** ceiling: reads
+come from the OS page cache (6.6 GB/s is RAM speed, not disk — over
+Thunderbolt 4, >5 GB/s from the device is physically impossible). The
+`F_NOCACHE` row is the **physical device**: ~3.2 GB/s writes and
+~2.6 GB/s reads. Because every engine benchmark in this document is
+deliberately cache-hot, engine percentages are computed against the
+host-path ceiling — they measure *engine overhead*, which is the thing
+this code can change. Against the physical device, the picture is
+stronger: FFS reads (1 540 MB/s) are ~59% of what cold media could
+deliver, and the 4 K-block and SFS engines already exceed the device's
+own read rate — meaning on real cold data they would be
+device-limited, not engine-limited. (A first edition of this paragraph
+"validated" the read ceiling with a one-sided F_NOCACHE test that
+still hit pages cached by the test's own write — bypass must be set on
+both sides.)
 
 That third row tells the real story: just by mimicking the Amiga's classic pattern of seeking and reading one 512-byte block at a time, we throw away 94% of our write speed and 81% of our read speed before the filesystem even begins to process data. This means that any engine relying on block-by-block I/O has a hard ceiling of 195 MB/s for writes and ~1 250 MB/s for reads, no matter how highly optimized the rest of its code might be.
 
@@ -78,7 +88,7 @@ effectively instant and stayed that way.
 
 Here is where our baseline performance started. After proving the mathematical correctness of our pure-Python engines, we ran a comprehensive benchmark across all filesystems *before* applying any I/O optimizations. 
 
-*(Note: The **%** columns indicate the fraction of the maximum raw SSD throughput—i.e., sequential access in large 4 MB chunks).*
+*(Note: The **%** columns indicate the fraction of the host I/O-path ceiling (page-cache-hot)—i.e., sequential access in large 4 MB chunks).*
 
 | Engine | write | % | read | % | create files/s |
 |---|---|---|---|---|---|
@@ -136,7 +146,7 @@ State of all engines after the four optimizations. Percentages are of
 the raw SSD ceiling (2 213 MB/s write / 5 779 MB/s read); the last
 column names the change chiefly responsible for each row's movement.
 
-| Engine | write | % of SSD | read | % of SSD | create f/s | vs. first edition | principal contributors |
+| Engine | write | % of host ceiling | read | % of host ceiling | create f/s | vs. first edition | principal contributors |
 |---|---|---|---|---|---|---|---|
 | OFS (DOS\0) | 38 MB/s | 1% | 530 MB/s | 8% | 2601 | ×1.6 w, ×2.8 r, ×9.9 c | writes format-bound (per-block embedded checksummed headers) |
 | FFS (DOS\3) | 1755 MB/s | 58% | 1540 MB/s | 23% | 7426 | ×15.0 w, ×6.2 r, ×26.1 c | run coalescing, O(1) free count, table slicing, ext-block batching |
