@@ -22,6 +22,7 @@ import time
 from datetime import timedelta
 
 from .ffs import FSError
+from ..blkdev import fill_parallel
 from .util import EPOCH, protect_to_str
 
 ROOT_ID = 0x53465300         # 'SFS\0'
@@ -1061,7 +1062,34 @@ class SFSVolume:
         return self._read_data(e)
 
     def read_file_bytes(self, path):
-        return b"".join(self.read_file(path))
+        e = path if isinstance(path, SFSEntry) else self.resolve(path)
+        if (not e.is_file() or e.is_link() or e.size == 0
+                or not hasattr(self.dev, "read_into")):
+            return b"".join(self.read_file(e if e.is_file() else path))
+        # extents are pure payload: read runs straight into one
+        # preallocated buffer (no per-chunk objects, no join copy)
+        segs = []
+        pos = 0
+        block = e.data
+        guard = 0
+        while pos < e.size:
+            if not block:
+                raise FSError("truncated SFS file %s (%d bytes missing)"
+                              % (e.name_str(), e.size - pos))
+            guard += 1
+            if guard > MAX_CHAIN:
+                raise FSError("cyclic SFS extent chain")
+            nxt, blocks = self._find_extent(block)
+            want = min(blocks * self.bs, e.size - pos)
+            segs.append((block * self.spb, pos, want))
+            pos += want
+            block = nxt
+        if len(segs) == 1 and e.size % self.dev.block_bytes == 0:
+            # single aligned extent: fresh-page read, no fill/copy
+            return self.dev.read(segs[0][0], e.size // self.dev.block_bytes)
+        out = bytearray(e.size)
+        fill_parallel(self.dev, memoryview(out), segs)
+        return out  # bytearray: avoids a full-payload copy
 
     def _read_data(self, entry):
         remaining = entry.size
@@ -1080,7 +1108,8 @@ class SFSVolume:
             todo = blocks
             cur = block
             while todo > 0 and remaining > 0:
-                n = min(todo, 512)
+                # 16 MB slices: cold NVMe needs large requests to pipeline
+                n = min(todo, max(1, (16 << 20) // self.bs))
                 data = self._read_block(cur, n)
                 if remaining < len(data):
                     data = data[:remaining]

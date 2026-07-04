@@ -52,6 +52,7 @@ class ImageFileBlkDev(BlockDevice):
         self.block_bytes = block_bytes
         mode = "rb" if read_only else "r+b"
         self.fh = open(path, mode)
+        self._nocache = nocache
         if nocache:
             # bypass the OS page cache (macOS F_NOCACHE): used by the
             # benchmark suite to measure true device-regime performance
@@ -70,6 +71,27 @@ class ImageFileBlkDev(BlockDevice):
             raise BlockDeviceError("short read at lba %d" % lba)
         return data
 
+    def read_into(self, lba, out):
+        """Read len(out) bytes starting at lba directly into a writable
+        buffer (no intermediate bytes object). Returns bytes read."""
+        self.fh.seek(lba * self.block_bytes)
+        return self.fh.readinto(out)
+
+    def pread_into(self, lba, out):
+        """Positional read into a buffer: thread-safe (no shared seek),
+        used by parallel read assembly. Coherent with buffered writes
+        because callers flush first."""
+        import os as _os
+        if getattr(self, "_raw_rfd", None) is None:
+            self._raw_rfd = _os.open(self.path, _os.O_RDONLY)
+            try:
+                import fcntl as _fcntl
+                if getattr(self, "_nocache", False) and hasattr(_fcntl, "F_NOCACHE"):
+                    _fcntl.fcntl(self._raw_rfd, _fcntl.F_NOCACHE, 1)
+            except ImportError:
+                pass
+        return _os.preadv(self._raw_rfd, [out], lba * self.block_bytes)
+
     def write(self, lba, data):
         if self.read_only:
             raise BlockDeviceError("device is read-only")
@@ -84,6 +106,10 @@ class ImageFileBlkDev(BlockDevice):
         os.fsync(self.fh.fileno())
 
     def close(self):
+        if getattr(self, "_raw_rfd", None) is not None:
+            import os as _os
+            _os.close(self._raw_rfd)
+            self._raw_rfd = None
         self.fh.close()
 
 
@@ -328,3 +354,43 @@ def open_blkdev(path, read_only=True):
     if footer[0:8] == VHD_COOKIE:
         return VHDBlkDev(path, read_only=read_only)
     return ImageFileBlkDev(path, read_only=read_only)
+
+
+def fill_parallel(dev, mv, segs, seg_bytes=16 << 20, threads=4):
+    """Fill memoryview `mv` from device runs in parallel.
+
+    segs: iterable of (lba, buf_offset, nbytes). Runs are split into
+    seg_bytes slices and read with positional pread on worker threads --
+    the GIL releases during I/O and NVMe queues serve them concurrently.
+    Falls back to sequential read_into when the device lacks pread_into.
+    """
+    if not hasattr(dev, "pread_into"):
+        for lba, off, nbytes in segs:
+            if dev.read_into(lba, mv[off : off + nbytes]) != nbytes:
+                raise BlockDeviceError("short read at lba %d" % lba)
+        return
+    dev.fh.flush()  # coherence: pread bypasses the buffered writer
+    work = []
+    bb = dev.block_bytes
+    for lba, off, nbytes in segs:
+        while nbytes > 0:
+            n = min(nbytes, seg_bytes)
+            work.append((lba, off, n))
+            lba += n // bb
+            off += n
+            nbytes -= n
+    if len(work) == 1:
+        lba, off, n = work[0]
+        if dev.pread_into(lba, mv[off : off + n]) != n:
+            raise BlockDeviceError("short read at lba %d" % lba)
+        return
+    from concurrent.futures import ThreadPoolExecutor
+
+    def job(seg):
+        lba, off, n = seg
+        if dev.pread_into(lba, mv[off : off + n]) != n:
+            raise BlockDeviceError("short read at lba %d" % lba)
+
+    with ThreadPoolExecutor(max_workers=threads) as ex:
+        for _ in ex.map(job, work):
+            pass

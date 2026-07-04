@@ -18,6 +18,7 @@ Addressing model (from the source):
 import struct
 
 from .ffs import FSError  # shared exception type
+from ..blkdev import fill_parallel
 from .util import amiga_to_datetime, protect_to_str
 
 # rootblock.disktype values
@@ -415,7 +416,37 @@ class PFS3Volume:
         return self._read_data(e)
 
     def read_file_bytes(self, path):
-        return b"".join(self.read_file(path))
+        e = path if isinstance(path, PFS3Entry) else self.resolve(path)
+        if (not e.is_file() or e.size == 0
+                or not hasattr(self.dev, "read_into")):
+            return b"".join(self.read_file(e if e.is_file() else path))
+        # extents are pure payload: read runs straight into one
+        # preallocated buffer (no per-chunk objects, no join copy)
+        bpb = self.bytes_per_block
+        chain = []
+        total = 0
+        for cs, bn in self._anode_chain(e.anode):
+            chain.append((cs, bn))
+            total += cs * bpb
+            if total >= e.size:
+                break
+        segs = []
+        pos = 0
+        for cs, bn in chain:
+            if pos >= e.size:
+                break
+            want = min(cs * bpb, e.size - pos)
+            segs.append((bn * self.spb, pos, want))
+            pos += want
+        if pos < e.size:
+            raise FSError("truncated PFS3 file %s (%d bytes missing)"
+                          % (e.name_str(), e.size - pos))
+        if len(segs) == 1 and e.size % self.dev.block_bytes == 0:
+            # single aligned extent: fresh-page read, no fill/copy
+            return self.dev.read(segs[0][0], e.size // self.dev.block_bytes)
+        out = bytearray(e.size)
+        fill_parallel(self.dev, memoryview(out), segs)
+        return out  # bytearray: avoids a full-payload copy
 
     def _read_data(self, entry):
         remaining = entry.size
@@ -430,7 +461,8 @@ class PFS3Volume:
             blocks_left = cs
             blk = bn
             while blocks_left > 0 and remaining > 0:
-                n = min(blocks_left, 512)
+                # 16 MB slices: cold NVMe needs large requests to pipeline
+                n = min(blocks_left, max(1, (16 << 20) // self.bytes_per_block))
                 data = self._read_blocks(blk, n)
                 if remaining < len(data):
                     data = data[:remaining]
@@ -454,7 +486,9 @@ class PFS3Volume:
             raise FSError("PFS3 volume is read-only (device or unsupported layout)")
 
     def _write_raw(self, blocknr, raw):
-        self.dev.write(blocknr * self.spb, bytes(raw))
+        if isinstance(raw, bytearray):
+            raw = bytes(raw)  # small metadata blocks
+        self.dev.write(blocknr * self.spb, raw)  # bytes/memoryview: no copy
 
     def _write_reserved(self, blocknr, raw):
         raw = bytearray(raw)
@@ -778,13 +812,22 @@ class PFS3Volume:
             self._roving = self._bitmapstart()
 
     def _flush_meta(self, touch_root_date):
-        for seq in self._bmb_dirty:
-            bmblk, raw = self._bmb_cache[seq]
-            self._write_reserved(bmblk, raw)
+        # coalesce consecutively-placed dirty reserved blocks into single
+        # device writes (each small write is a device round-trip)
+        dirty = [self._bmb_cache[s] for s in self._bmb_dirty]
+        dirty += [self._ab_cache[s] for s in self._ab_dirty]
+        dirty.sort(key=lambda t: t[0])
+        i = 0
+        while i < len(dirty):
+            j = i + 1
+            step = self.rescluster
+            while (j < len(dirty)
+                   and dirty[j][0] == dirty[j - 1][0] + step):
+                j += 1
+            payload = b"".join(bytes(raw) for _, raw in dirty[i:j])
+            self.dev.write(dirty[i][0] * self.spb, payload)
+            i = j
         self._bmb_dirty = set()
-        for seq in self._ab_dirty:
-            ablk, araw = self._ab_cache[seq]
-            self._write_reserved(ablk, araw)
         self._ab_dirty = set()
         # rootblock counters + datestamp
         struct.pack_into(">I", self.root_raw, 8, self.datestamp)

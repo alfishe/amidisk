@@ -17,6 +17,8 @@ All eight classic dostypes are fully supported, including write:
 import struct
 from datetime import datetime
 
+from ..blkdev import fill_parallel
+
 from .util import (
     amiga_to_datetime,
     datetime_to_amiga,
@@ -331,11 +333,38 @@ class Bitmap:
                 rn = 0
 
         start = self._cursor if vol.reserved <= self._cursor < vol.total else vol.reserved
+        # large allocations: start 4 KB-aligned so the data writes keep
+        # the direct-I/O path (unaligned F_NOCACHE writes run at ~half
+        # speed); the skipped blocks simply remain free
+        if count >= 4096:
+            bpb = 4096 // (vol.dev.block_bytes * vol.spb)
+            if bpb > 1 and start % bpb:
+                start += bpb - start % bpb
+                if start >= vol.total:
+                    start = vol.reserved
         blk = start
         total = vol.total
         wrapped = False
         while got < count:
             idx = blk - vol.reserved
+            bpp = self.bits_per_page
+            if (idx % bpp == 0 and got + bpp <= count and blk + bpp <= total):
+                page, off = self._locate(blk)
+                buf = self.pages[page]
+                if bytes(buf.data[4:]) == b"\xff" * (vol.bs - 4):
+                    # entire page free: grab all its blocks in one step
+                    buf.data[4:] = b"\x00" * (vol.bs - 4)
+                    self.dirty.add(page)
+                    if self._free_count is not None:
+                        self._free_count -= bpp
+                    if rn and rs + rn == blk:
+                        rn += bpp
+                    else:
+                        close()
+                        rs, rn = blk, bpp
+                    got += bpp
+                    blk += bpp
+                    continue
             if idx % 32 == 0 and blk + 32 <= total:
                 page, off = self._locate(blk)
                 buf = self.pages[page]
@@ -412,10 +441,24 @@ class Bitmap:
         return free
 
     def flush(self):
-        for page in sorted(self.dirty):
-            buf = self.pages[page]
-            buf.fix_checksum(0)
-            self.vol.write_buf(self.page_blks[page], buf)
+        """Write dirty pages, coalescing consecutively-placed pages into
+        one device write (each small write is a device round-trip)."""
+        pages = sorted(self.dirty)
+        i = 0
+        while i < len(pages):
+            j = i + 1
+            while (j < len(pages) and pages[j] == pages[j - 1] + 1
+                   and self.page_blks[pages[j]]
+                       == self.page_blks[pages[j - 1]] + 1):
+                j += 1
+            parts = []
+            for p in pages[i:j]:
+                buf = self.pages[p]
+                buf.fix_checksum(0)
+                parts.append(bytes(buf.data))
+            self.vol.dev.write(self.page_blks[pages[i]] * self.vol.spb,
+                               b"".join(parts))
+            i = j
         self.dirty.clear()
 
 
@@ -629,7 +672,96 @@ class FFSVolume:
         return self._read_data(e)
 
     def read_file_bytes(self, path):
-        return b"".join(self.read_file(path))
+        e = self.resolve(path) if not isinstance(path, Entry) else path
+        if e.sec_type == ST_LINKFILE and e.real_entry:
+            e = Entry.parse(self.read_buf(e.real_entry), e.real_entry,
+                            self.is_longname)
+        if not e.is_file():
+            raise FSError("not a file: %s" % e.name_str())
+        if not self.ffs or e.size == 0 or not hasattr(self.dev, "read_into"):
+            return b"".join(self._read_data(e))
+        # FFS data blocks are pure payload: read runs straight into one
+        # preallocated buffer -- no per-chunk objects, no join copy
+        runs = list(self._data_runs(e))
+        segs = []
+        pos = 0
+        for start, count in runs:
+            want = min(count * self.bs, e.size - pos)
+            segs.append((start * self.spb, pos, want))
+            pos += want
+            if pos >= e.size:
+                break
+        if pos < e.size:
+            raise FSError("missing extension block in %s" % e.name_str())
+        if len(segs) == 1 and e.size % self.bs == 0:
+            # single aligned run: freshly allocated pages from one read
+            # beat readinto-a-reused-buffer by ~2x on this hardware
+            return self.dev.read(segs[0][0], e.size // self.dev.block_bytes)
+        out = bytearray(e.size)
+        fill_parallel(self.dev, memoryview(out), segs)
+        return out  # bytearray: avoids a full-payload copy
+
+    def _data_runs(self, entry):
+        """Yield (start, count) data runs by walking the ext chain,
+        without materializing a per-block pointer list. Each table chunk
+        is verified consecutive with one C-speed tuple compare; permuted
+        tables fall back to per-pointer runs (never misread)."""
+        blk = entry.blk
+        guard = 0
+        data_bytes = self.bs  # FFS only
+        need = (entry.size + data_bytes - 1) // data_bytes
+        bs, tsz = self.bs, self.tsz
+        got_ptrs = 0
+        run_s = run_n = 0
+        first = True
+        while blk and got_ptrs < need:
+            batch = 1 if first else min(1024, max(1, self.total - blk))
+            first = False
+            raw = self.dev.read(blk * self.spb, batch * self.spb)
+            off = 0
+            cur = blk
+            while True:
+                guard += 1
+                if guard > MAX_CHAIN:
+                    raise FSError("cyclic extension chain in file %s"
+                                  % entry.name_str())
+                count = struct.unpack_from(">I", raw, off + 8)[0]
+                if count == 0:
+                    raise FSError("truncated file %s" % entry.name_str())
+                count = min(count, tsz, need - got_ptrs)
+                lo = off + 24 + (tsz - count) * 4
+                chunk = struct.unpack_from(">%dI" % count, raw, lo)
+                hi = chunk[0]
+                if chunk == tuple(range(hi, hi - count, -1)):
+                    b = hi - count + 1  # consecutive ascending in file order
+                    if run_n and run_s + run_n == b:
+                        run_n += count
+                    else:
+                        if run_n:
+                            yield run_s, run_n
+                        run_s, run_n = b, count
+                else:  # rare: fragmented table, per-pointer fallback
+                    for p in reversed(chunk):
+                        if p == 0:
+                            raise FSError("hole in data block table of %s"
+                                          % entry.name_str())
+                        if run_n and run_s + run_n == p:
+                            run_n += 1
+                        else:
+                            if run_n:
+                                yield run_s, run_n
+                            run_s, run_n = p, 1
+                got_ptrs += count
+                nxt = struct.unpack_from(">I", raw, off + bs - 8)[0]
+                if (nxt == cur + 1 and off + 2 * bs <= len(raw)
+                        and got_ptrs < need):
+                    off += bs
+                    cur = nxt
+                    continue
+                blk = nxt
+                break
+        if run_n:
+            yield run_s, run_n
 
     def _data_block_table(self, entry):
         """All data-block pointers of a file, in order."""
@@ -638,23 +770,41 @@ class FFSVolume:
         guard = 0
         data_bytes = self.bs if self.ffs else self.bs - 24
         need = (entry.size + data_bytes - 1) // data_bytes
+        bs, tsz = self.bs, self.tsz
+        first = True
         while blk and len(ptrs) < need:
-            guard += 1
-            if guard > MAX_CHAIN:
-                raise FSError("cyclic extension chain in file %s" % entry.name_str())
-            buf = self.read_buf(blk)
-            count = buf.long(2)
-            if count == 0:
-                raise FSError("truncated file %s" % entry.name_str())
-            count = min(count, self.tsz)
-            # the table is stored reversed; unpack the used slice in one
-            # call instead of one struct.unpack per pointer
-            lo = 24 + (self.tsz - count) * 4
-            chunk = struct.unpack_from(">%dI" % count, buf.data, lo)
-            if 0 in chunk:
-                raise FSError("hole in data block table of %s" % entry.name_str())
-            ptrs.extend(reversed(chunk))
-            blk = buf.long(-2)
+            # ext blocks are allocated consecutively (by our writer and
+            # usually by AmigaOS): read speculative batches of 256 and
+            # walk the chain inside the buffer while pointers stay
+            # consecutive -- 5 690 single-block reads become ~23 batches
+            batch = 1 if first else min(1024, max(1, self.total - blk))
+            first = False
+            raw = self.dev.read(blk * self.spb, batch * self.spb)
+            off = 0
+            cur = blk
+            while True:
+                guard += 1
+                if guard > MAX_CHAIN:
+                    raise FSError(
+                        "cyclic extension chain in file %s" % entry.name_str())
+                count = struct.unpack_from(">I", raw, off + 8)[0]
+                if count == 0:
+                    raise FSError("truncated file %s" % entry.name_str())
+                count = min(count, tsz)
+                lo = off + 24 + (tsz - count) * 4
+                chunk = struct.unpack_from(">%dI" % count, raw, lo)
+                if 0 in chunk:
+                    raise FSError(
+                        "hole in data block table of %s" % entry.name_str())
+                ptrs.extend(reversed(chunk))
+                nxt = struct.unpack_from(">I", raw, off + bs - 8)[0]
+                if (nxt == cur + 1 and off + 2 * bs <= len(raw)
+                        and len(ptrs) < need):
+                    off += bs
+                    cur = nxt
+                    continue
+                blk = nxt
+                break
         if len(ptrs) < need:
             raise FSError("missing extension block in %s" % entry.name_str())
         return ptrs[:need]
@@ -667,7 +817,8 @@ class FFSVolume:
             return
         ptrs = self._data_block_table(entry)
         data_bytes = self.bs if self.ffs else self.bs - 24
-        MAX_RUN = max(1, (4 << 20) // self.bs)
+        # 16 MB runs: cold NVMe needs large requests to pipeline
+        MAX_RUN = max(1, (16 << 20) // self.bs)
         i = 0
         n = len(ptrs)
         while i < n and remaining > 0:
@@ -1033,10 +1184,22 @@ class FFSVolume:
         ndata = (size + data_bytes - 1) // data_bytes
         next_ext = max(0, ndata - self.tsz)
         next_blocks = (next_ext + self.tsz - 1) // self.tsz
-        blocks = self.bitmap.alloc(1 + ndata + next_blocks)
-        hdr_blk = blocks[0]
-        data_blks = blocks[1 : 1 + ndata]
-        ext_blks = blocks[1 + ndata :]
+        if self.ffs:
+            # runs-based allocation: no per-block pointer list, the write
+            # path and pointer tables work in (start, count) runs
+            hdr_blk = self.bitmap.alloc(1)[0]
+            data_runs = self.bitmap.alloc_runs(ndata) if ndata else []
+            ext_blks = self.bitmap.alloc(next_blocks) if next_blocks else []
+            data_blks = None
+            first_data_blk = data_runs[0][0] if data_runs else 0
+            blocks = None
+        else:
+            blocks = self.bitmap.alloc(1 + ndata + next_blocks)
+            hdr_blk = blocks[0]
+            data_blks = blocks[1 : 1 + ndata]
+            ext_blks = blocks[1 + ndata :]
+            data_runs = None
+            first_data_blk = data_blks[0] if data_blks else 0
 
         try:
             # data blocks: coalesce consecutive allocations into large
@@ -1065,40 +1228,51 @@ class FFSVolume:
                     del sbuf[:n]
                     return chunk
 
-            MAX_RUN = max(1, (4 << 20) // self.bs)  # cap run buffers at 4 MB
-            fully_contig = (ndata > 0
-                            and data_blks[-1] - data_blks[0] + 1 == ndata)
+            MAX_RUN = max(1, (16 << 20) // self.bs)
+            if self.ffs:
+                is_buf = isinstance(data, (bytes, bytearray, memoryview))
+                written = 0  # blocks written so far
+                for rs, rn in data_runs:
+                    ro = 0
+                    while ro < rn:
+                        # zero-copy source: write the whole run in one
+                        # call (a single large write beats chunking on
+                        # this hardware); chunk only streamed sources
+                        m = rn - ro if is_buf else min(rn - ro, MAX_RUN)
+                        blk0 = rs + ro
+                        want = min(m * self.bs, size - written * self.bs)
+                        if isinstance(data, (bytes, bytearray, memoryview)):
+                            base = written * self.bs
+                            full = want - (want % self.bs)
+                            if full:
+                                self.dev.write(blk0 * self.spb,
+                                               src[base : base + full])
+                            if want != full:
+                                tail = bytes(src[base + full : base + want])
+                                tail += b"\x00" * (self.bs - len(tail))
+                                self.dev.write(
+                                    (blk0 + full // self.bs) * self.spb, tail)
+                            pos[0] = base + want
+                        else:
+                            payload = pull(want)
+                            pad = m * self.bs - len(payload)
+                            if pad:
+                                payload += b"\x00" * pad
+                            self.dev.write(blk0 * self.spb, payload)
+                        written += m
+                        ro += m
+                        if written * self.bs >= size:
+                            break
             i = 0
-            while i < ndata:
+            while (not self.ffs) and i < ndata:
                 # extend the run while block numbers stay consecutive
-                if fully_contig:
-                    j = min(ndata, i + MAX_RUN)
-                else:
+                if True:
                     j = i + 1
                     while (j < ndata and j - i < MAX_RUN
                            and data_blks[j] == data_blks[j - 1] + 1):
                         j += 1
                 want = min((j - i) * data_bytes, size - i * data_bytes)
-                if self.ffs and isinstance(data, (bytes, bytearray, memoryview)):
-                    # zero-copy: full blocks straight from the source view
-                    base = i * data_bytes
-                    full = want - (want % self.bs)
-                    if full:
-                        self.dev.write(data_blks[i] * self.spb,
-                                       src[base : base + full])
-                    if want != full:
-                        tail = bytes(src[base + full : base + want])
-                        tail += b"\x00" * (self.bs - len(tail))
-                        self.dev.write(
-                            (data_blks[i] + full // self.bs) * self.spb, tail)
-                    pos[0] = base + want
-                elif self.ffs:
-                    payload = pull(want)
-                    pad = (j - i) * self.bs - len(payload)
-                    if pad:
-                        payload += b"\x00" * pad
-                    self.dev.write(data_blks[i] * self.spb, payload)
-                else:
+                if True:
                     payload = pull(want)
                     run = bytearray((j - i) * self.bs)
                     for k in range(i, j):
@@ -1125,7 +1299,13 @@ class FFSVolume:
             bs, nl, tsz = self.bs, self.nl, self.tsz
             # all tables are slices of the pointer list in descending
             # order: pack it once, slice per block (no per-table tuples)
-            desc = struct.pack(">%dI" % ndata, *data_blks[::-1]) if ndata else b""
+            if self.ffs:
+                desc = b"".join(
+                    struct.pack(">%dI" % rn, *range(rs + rn - 1, rs - 1, -1))
+                    for rs, rn in reversed(data_runs)) if ndata else b""
+            else:
+                desc = (struct.pack(">%dI" % ndata, *data_blks[::-1])
+                        if ndata else b"")
 
             def table_bytes(a, b):
                 return desc[(ndata - b) * 4 : (ndata - a) * 4]
@@ -1159,19 +1339,25 @@ class FFSVolume:
             buf = self._new_header(hdr_blk, ST_FILE, parent.blk, name, protect, comment)
             if mtime is not None:
                 self._now_stamp(buf, self._date_loc(hdr_blk), mtime)
-            head = data_blks[: self.tsz]
-            buf.put_long(2, len(head))
-            buf.put_long(4, data_blks[0] if data_blks else 0)
-            if head:  # table is stored reversed; slice the packed pointers
-                lo = 24 + (self.tsz - len(head)) * 4
-                buf.data[lo : 24 + self.tsz * 4] = table_bytes(0, len(head))
+            head_n = min(self.tsz, ndata)
+            buf.put_long(2, head_n)
+            buf.put_long(4, first_data_blk)
+            if head_n:  # table is stored reversed; slice the packed pointers
+                lo = 24 + (self.tsz - head_n) * 4
+                buf.data[lo : 24 + self.tsz * 4] = table_bytes(0, head_n)
             buf.put_long(-47, size)
             buf.put_long(-2, next_ext_ptr)
             buf.fix_checksum()
             self.write_buf(hdr_blk, buf)
             
         except Exception:
-            self.bitmap.free(blocks)
+            if blocks is not None:
+                self.bitmap.free(blocks)
+            else:
+                self.bitmap.free([hdr_blk])
+                self.bitmap.free(ext_blks)
+                for rs, rn in data_runs:
+                    self.bitmap.free(range(rs, rs + rn))
             self.bitmap.flush()
             raise
 
