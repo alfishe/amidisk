@@ -723,9 +723,39 @@ class PFS3Volume:
         self._save_anode(anodenr, 0, 0, 0)
 
     # -- transaction bookkeeping ----------------------------------------------
+    def bulk(self, flush_every=1024):
+        """Context manager for mass imports: keeps bitmap/anode caches
+        across operations and defers the rootblock/extension rewrite,
+        flushing every `flush_every` operations and at exit (including
+        on error). A crash mid-bulk can lose up to `flush_every`
+        operations of bitmap/anode/counter updates; recover with
+        pfsDoctor or re-import from the source."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _ctx():
+            self._require_writable()
+            self._bulk_depth = getattr(self, "_bulk_depth", 0) + 1
+            self._bulk_every = max(1, flush_every)
+            self._bulk_ops = 0
+            try:
+                yield self
+            finally:
+                self._bulk_depth -= 1
+                if self._bulk_depth == 0:
+                    self._flush_meta(True)
+                    self._drop_txn_caches()
+
+        return _ctx()
+
     def _begin(self):
         self._require_writable()
         self.datestamp += 1
+        if getattr(self, "_bulk_depth", 0) and hasattr(self, "_bmb_cache"):
+            # bulk mode: accumulate dirty state across operations
+            if not hasattr(self, "_roving"):
+                self._roving = self._bitmapstart()
+            return
         self._bmb_cache = {}
         self._bmb_dirty = set()
         self._ab_cache = {}
@@ -733,13 +763,15 @@ class PFS3Volume:
         if not hasattr(self, "_roving"):
             self._roving = self._bitmapstart()
 
-    def _commit(self, touch_root_date=True):
+    def _flush_meta(self, touch_root_date):
         for seq in self._bmb_dirty:
             bmblk, raw = self._bmb_cache[seq]
             self._write_reserved(bmblk, raw)
+        self._bmb_dirty = set()
         for seq in self._ab_dirty:
             ablk, araw = self._ab_cache[seq]
             self._write_reserved(ablk, araw)
+        self._ab_dirty = set()
         # rootblock counters + datestamp
         struct.pack_into(">I", self.root_raw, 8, self.datestamp)
         struct.pack_into(">I", self.root_raw, 60, self.reserved_free)
@@ -755,8 +787,23 @@ class PFS3Volume:
                 d, m, t = datetime_to_amiga(_dt.now())
                 struct.pack_into(">3H", self.rext, 16, d & 0xFFFF, m, t)
             self._write_reserved(self.extension, self.rext)
+
+    def _drop_txn_caches(self):
+        self._bmb_cache = {}
+        self._bmb_dirty = set()
+        self._ab_cache = {}
+        self._ab_dirty = set()
         self._anode_cache.clear()
         self._index_cache.clear()
+
+    def _commit(self, touch_root_date=True):
+        if getattr(self, "_bulk_depth", 0):
+            self._bulk_ops += 1
+            if self._bulk_ops % self._bulk_every == 0:
+                self._flush_meta(touch_root_date)
+            return
+        self._flush_meta(touch_root_date)
+        self._drop_txn_caches()
 
     # -- directory manipulation --------------------------------------------
     def _dir_chain(self, dir_anodenr):

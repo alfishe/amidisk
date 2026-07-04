@@ -1252,11 +1252,41 @@ class SFSVolume:
     def _node_shift(self):
         return (self.bs.bit_length() - 1) - 5  # blocksize_bits - BLCKFACCURACY
 
+    def bulk(self, flush_every=1024):
+        """Context manager for mass imports: defers the per-operation
+        RootInfo free-count write and root-object date update, flushing
+        every `flush_every` operations and at exit (including on error).
+        A crash mid-bulk leaves the RootInfo free counter stale by up to
+        `flush_every` operations; structures themselves are written
+        immediately, so `check` still passes apart from the counter."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _ctx():
+            self._require_writable()
+            self._bulk_depth = getattr(self, "_bulk_depth", 0) + 1
+            self._bulk_every = max(1, flush_every)
+            self._bulk_ops = 0
+            try:
+                yield self
+            finally:
+                self._bulk_depth -= 1
+                if self._bulk_depth == 0:
+                    self._write_freeblocks()
+                    self._write_volume_date()
+
+        return _ctx()
+
+    def _write_freeblocks(self):
+        raw = bytearray(self._read_block(self.rootobjectcontainer))
+        struct.pack_into(">I", raw, self.bs - 36 + 8, self.freeblocks)
+        self._write_block(self.rootobjectcontainer, raw)
+
     def _set_freeblocks(self, value):
         self.freeblocks = value
-        raw = bytearray(self._read_block(self.rootobjectcontainer))
-        struct.pack_into(">I", raw, self.bs - 36 + 8, value)
-        self._write_block(self.rootobjectcontainer, raw)
+        if getattr(self, "_bulk_depth", 0):
+            return  # deferred: flushed at the next batch point / bulk exit
+        self._write_freeblocks()
 
     def _mark_space(self, start, count, free=True):
         """Override: also maintains the RootInfo free-block counter."""
@@ -1933,10 +1963,20 @@ class SFSVolume:
         # containers of a moved directory keep parent = its own node: ok
         self._touch_volume()
 
-    def _touch_volume(self):
-        """Volume modification -> root object datemodified (never the
-        rootblock, whose datecreated is immutable)."""
+    def _write_volume_date(self):
         secs = int((__import__("datetime").datetime.now() - EPOCH).total_seconds())
         raw = bytearray(self._read_block(self.rootobjectcontainer))
         struct.pack_into(">I", raw, 24 + 20, max(0, secs))
         self._write_block(self.rootobjectcontainer, raw)
+
+    def _touch_volume(self):
+        """Volume modification -> root object datemodified (never the
+        rootblock, whose datecreated is immutable). Deferred and batched
+        inside bulk()."""
+        if getattr(self, "_bulk_depth", 0):
+            self._bulk_ops += 1
+            if self._bulk_ops % self._bulk_every == 0:
+                self._write_freeblocks()
+                self._write_volume_date()
+            return
+        self._write_volume_date()

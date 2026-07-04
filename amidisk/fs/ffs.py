@@ -479,18 +479,27 @@ class FFSVolume:
         return cur
 
     def _find_in_dir(self, dir_buf, name):
+        """Hash-chain lookup. Chain nodes are compared by extracting only
+        the name and chain pointer from the raw block; the full Entry is
+        parsed once, for the match -- chain walks dominate bulk imports."""
         h = hash_name(name, self.tsz, self.intl)
         blk = dir_buf.long(6 + h)
         guard = 0
+        bs = self.bs
         while blk:
             guard += 1
             if guard > MAX_CHAIN:
                 raise FSError("cyclic hash chain")
-            buf = self.read_buf(blk)
-            e = Entry.parse(buf, blk, self.is_longname)
-            if names_equal(e.name, name, self.intl):
-                return e
-            blk = e.hash_chain
+            raw = self.dev.read(blk * self.spb, self.spb)
+            if self.is_longname:
+                nl = min(raw[bs - 184], 107)
+                nm = raw[bs - 183 : bs - 183 + nl]
+            else:
+                nl = min(raw[bs - 80], MAX_NAME)
+                nm = raw[bs - 79 : bs - 79 + nl]
+            if names_equal(nm, name, self.intl):
+                return Entry.parse(BlockBuf(raw, bs), blk, self.is_longname)
+            blk = struct.unpack_from(">I", raw, bs - 16)[0]
         return None
 
     def list_dir(self, path=""):
@@ -564,11 +573,14 @@ class FFSVolume:
             count = buf.long(2)
             if count == 0:
                 raise FSError("truncated file %s" % entry.name_str())
-            for k in range(min(count, self.tsz)):
-                ptr = buf.long(6 + self.tsz - 1 - k)
-                if ptr == 0:
-                    raise FSError("hole in data block table of %s" % entry.name_str())
-                ptrs.append(ptr)
+            count = min(count, self.tsz)
+            # the table is stored reversed; unpack the used slice in one
+            # call instead of one struct.unpack per pointer
+            lo = 24 + (self.tsz - count) * 4
+            chunk = struct.unpack_from(">%dI" % count, buf.data, lo)
+            if 0 in chunk:
+                raise FSError("hole in data block table of %s" % entry.name_str())
+            ptrs.extend(reversed(chunk))
             blk = buf.long(-2)
         if len(ptrs) < need:
             raise FSError("missing extension block in %s" % entry.name_str())
@@ -613,6 +625,58 @@ class FFSVolume:
         buf.put_long(long_idx + 1, m)
         buf.put_long(long_idx + 2, t)
 
+    # -- bulk mode -----------------------------------------------------------
+    def bulk(self, flush_every=1024):
+        """Context manager for mass imports: defers the per-operation
+        bitmap flush and volume-date update, committing every
+        `flush_every` operations and once at exit (including on error).
+
+        While active, the on-disk bitmap-valid flag (bm_flag) is cleared
+        -- the same 'volume not validated' convention AmigaOS uses -- so
+        a crash mid-bulk leaves an explicitly marked-dirty volume that
+        `check` reports and `repair --write` fully reconstructs. The
+        trade: a crash window of up to `flush_every` operations whose
+        allocations exist only in RAM, in exchange for ~3 fewer metadata
+        writes per file.
+        """
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _ctx():
+            self._require_writable()
+            self._bulk_depth = getattr(self, "_bulk_depth", 0) + 1
+            self._bulk_every = max(1, flush_every)
+            self._bulk_ops = 0
+            if self._bulk_depth == 1:
+                root = self.read_buf(self.root_blk)
+                root.put_slong(-50, 0)  # bm_flag: bitmap not valid
+                root.fix_checksum()
+                self.write_buf(self.root_blk, root)
+            try:
+                yield self
+            finally:
+                self._bulk_depth -= 1
+                if self._bulk_depth == 0:
+                    self.bitmap.flush()
+                    root = self.read_buf(self.root_blk)
+                    root.put_slong(-50, -1)  # bitmap valid again
+                    root.fix_checksum()
+                    self.write_buf(self.root_blk, root)
+                    self._touch_volume()
+
+        return _ctx()
+
+    def _commit_meta(self):
+        """Per-mutation commit point: immediate in normal mode, deferred
+        and batched inside bulk()."""
+        if getattr(self, "_bulk_depth", 0):
+            self._bulk_ops += 1
+            if self._bulk_ops % self._bulk_every == 0:
+                self.bitmap.flush()
+            return
+        self.bitmap.flush()
+        self._touch_volume()
+
     def _touch_volume(self):
         root = self.read_buf(self.root_blk)
         self._now_stamp(root, -10)  # volume modified date
@@ -650,52 +714,55 @@ class FFSVolume:
                 + (" (dircache volumes are not writable)" if getattr(self, "dircache", False) else "")
             )
 
+    def _resolve_dir_cached(self, path_parts):
+        """Resolve a directory path with a block-number cache.
+
+        Bulk imports resolve the same parent for thousands of files;
+        without the cache every write walks the path from the root. The
+        cache maps the normalized path to the dir header block and is
+        cleared wholesale on delete/rename (rare during imports).
+        """
+        key = b"/".join(path_parts)
+        cache = getattr(self, "_dircache", None)
+        if cache is None:
+            cache = self._dircache = {}
+        blk = cache.get(key)
+        if blk is not None:
+            e = Entry.parse(self.read_buf(blk), blk, self.is_longname)
+            if e.is_dir():  # stale entries fall through to a full resolve
+                return e
+            del cache[key]
+        e = self.resolve(key)
+        if e.is_dir() and e.sec_type != ST_ROOT and len(cache) < 65536:
+            cache[key] = e.blk
+        return e
+
     def _resolve_parent(self, path):
         """Split path into (parent Entry, name bytes)."""
         parts = self._split(path)
         if not parts:
             raise FSError("empty path")
         name = self._check_name(parts[-1], self.max_name_len)
-        parent_path = b"/".join(parts[:-1])
-        parent = self.resolve(parent_path)
+        parent = self._resolve_dir_cached(parts[:-1])
         if not parent.is_dir():
             raise FSError("parent is not a directory")
         return parent, name
 
     def _link_entry(self, dir_blk, new_blk, name):
-        """Insert block into the dir's hash chain (ascending block order)."""
+        """Insert block at the head of the dir's hash chain, as the ROM
+        FastFileSystem does (the format imposes no chain ordering, and a
+        head insert is O(1) instead of a full chain walk)."""
         h = hash_name(name, self.tsz, self.intl)
         dbuf = self.read_buf(dir_blk)
-        chain = []
-        blk = dbuf.long(6 + h)
-        guard = 0
-        while blk:
-            guard += 1
-            if guard > MAX_CHAIN:
-                raise FSError("cyclic hash chain")
-            chain.append(blk)
-            blk = Entry.parse(self.read_buf(blk), blk, self.is_longname).hash_chain
-        # insertion point: keep chain sorted ascending by block number
-        pos = 0
-        while pos < len(chain) and chain[pos] < new_blk:
-            pos += 1
-        succ = chain[pos] if pos < len(chain) else 0
+        head = dbuf.long(6 + h)
         nbuf = self.read_buf(new_blk)
-        nbuf.put_long(-4, succ)
+        nbuf.put_long(-4, head)
         nbuf.fix_checksum()
         self.write_buf(new_blk, nbuf)
-        if pos == 0:
-            dbuf.put_long(6 + h, new_blk)
-            self._now_stamp(dbuf, self._date_loc(dir_blk))
-            dbuf.fix_checksum()
-            self.write_buf(dir_blk, dbuf)
-        else:
-            prev = chain[pos - 1]
-            pbuf = self.read_buf(prev)
-            pbuf.put_long(-4, new_blk)
-            pbuf.fix_checksum()
-            self.write_buf(prev, pbuf)
-            self._touch_dir(dir_blk)
+        dbuf.put_long(6 + h, new_blk)
+        self._now_stamp(dbuf, self._date_loc(dir_blk))
+        dbuf.fix_checksum()
+        self.write_buf(dir_blk, dbuf)
 
     def _unlink_entry(self, entry):
         """Remove entry from its parent's hash chain."""
@@ -855,8 +922,7 @@ class FFSVolume:
             nbuf.fix_checksum()
             self.write_buf(blk, nbuf)
             self._update_dircache(parent.blk)
-        self.bitmap.flush()
-        self._touch_volume()
+        self._commit_meta()
         return blk
 
     def makedirs(self, path):
@@ -969,8 +1035,10 @@ class FFSVolume:
                 buf.put_long(0, T_LIST)
                 buf.put_long(1, blk)
                 buf.put_long(2, len(part))
-                for k, p in enumerate(part):
-                    buf.put_long(6 + self.tsz - 1 - k, p)
+                if part:  # table is stored reversed; pack it in one call
+                    lo = 24 + (self.tsz - len(part)) * 4
+                    buf.data[lo : 24 + self.tsz * 4] = struct.pack(
+                        ">%dI" % len(part), *reversed(part))
                 buf.put_long(-3, hdr_blk)
                 buf.put_long(-2, next_ext_ptr)
                 buf.put_slong(-1, ST_FILE)
@@ -985,8 +1053,10 @@ class FFSVolume:
             head = data_blks[: self.tsz]
             buf.put_long(2, len(head))
             buf.put_long(4, data_blks[0] if data_blks else 0)
-            for k, p in enumerate(head):
-                buf.put_long(6 + self.tsz - 1 - k, p)
+            if head:  # table is stored reversed; pack it in one call
+                lo = 24 + (self.tsz - len(head)) * 4
+                buf.data[lo : 24 + self.tsz * 4] = struct.pack(
+                    ">%dI" % len(head), *reversed(head))
             buf.put_long(-47, size)
             buf.put_long(-2, next_ext_ptr)
             buf.fix_checksum()
@@ -999,8 +1069,7 @@ class FFSVolume:
 
         self._link_entry(parent.blk, hdr_blk, name)
         self._update_dircache(parent.blk)
-        self.bitmap.flush()
-        self._touch_volume()
+        self._commit_meta()
         return hdr_blk
 
     def _entry_blocks(self, entry):
@@ -1045,16 +1114,19 @@ class FFSVolume:
             # re-read: child deletions touched this dir block
             entry = Entry.parse(self.read_buf(entry.blk), entry.blk, self.is_longname)
         self._unlink_entry(entry)
+        if getattr(self, "_dircache", None):
+            self._dircache.clear()
         self.bitmap.free(self._entry_blocks(entry))
         self._update_dircache(entry.parent)
-        self.bitmap.flush()
-        self._touch_volume()
+        self._commit_meta()
 
     def rename(self, src, dst):
         self._require_writable()
         entry = self.resolve(src)
         if entry.sec_type == ST_ROOT:
             raise FSError("cannot rename the root directory")
+        if getattr(self, "_dircache", None):
+            self._dircache.clear()
         new_parent, new_name = self._resolve_parent(dst)
         dbuf = self.read_buf(new_parent.blk)
         clash = self._find_in_dir(dbuf, new_name)
@@ -1107,8 +1179,7 @@ class FFSVolume:
         self._update_dircache(entry.parent)
         if new_parent.blk != entry.parent:
             self._update_dircache(new_parent.blk)
-        self.bitmap.flush()
-        self._touch_volume()
+        self._commit_meta()
 
     # -- formatting ----------------------------------------------------------
     def format(self, label, dos_type=None):

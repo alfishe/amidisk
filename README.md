@@ -31,6 +31,15 @@ All engines support **streaming**: `read_file()` yields chunks and
 iterators, so image-to-image copies (`amidisk cp`) never buffer whole
 files or touch temp files.
 
+**Bulk mode** (`put -r --bulk`, `cp --bulk`, or `with vol.bulk():` in
+the API) batches metadata commits during mass imports: bitmap flushes
+and volume-date updates happen every 1024 operations instead of every
+file, and on FFS the volume is marked *not validated* (the AmigaOS
+convention) for the duration. Default behavior is unchanged. The trade:
+if the process dies mid-bulk, up to one batch of allocations exists
+only in memory — `check` detects the state and `repair --write`
+reconstructs it on FFS; on PFS3 use pfsDoctor or re-import.
+
 Validated against: volumes written by AmigaOS 3.2.3 itself (the sample
 images), amitools/xdftool (differential, both directions), hst-imager's
 independent C# PFS3 implementation (reads our writes and formats
@@ -58,7 +67,7 @@ amidisk info IMAGE                 # containers, RDB, partitions, volumes
 amidisk ls IMAGE [VOL:path] [--json]
 amidisk cat IMAGE VOL:path/file
 amidisk extract IMAGE VOL:path DEST [-r]     # preserves mtimes
-amidisk put IMAGE HOSTFILE VOL:path [-r] [--comment C] [--protect bits]
+amidisk put IMAGE HOSTFILE VOL:path [-r] [--bulk] [--comment C] [--protect bits]
 amidisk mkdir IMAGE VOL:path [-p]
 amidisk rm IMAGE VOL:path [-r]
 amidisk mv IMAGE VOL:old VOL:new

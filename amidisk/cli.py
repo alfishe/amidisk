@@ -334,7 +334,11 @@ def cmd_cp(args):
         base_prefix = "/".join(p.decode("latin-1") for p in src_vol._split(src_path))
         base_dest = dst_path.rstrip("/")
         
-        for prefix, e in src_vol.walk(src_path):
+        import contextlib as _ctxlib
+        bulk_ctx = (dst_vol.bulk() if getattr(args, "bulk", False)
+                    and hasattr(dst_vol, "bulk") else _ctxlib.nullcontext())
+        with bulk_ctx:
+         for prefix, e in src_vol.walk(src_path):
             rel = prefix[len(base_prefix):].lstrip("/") if base_prefix else prefix
             amiga_dir = base_dest + ("/" + rel if rel else "") if base_dest else rel
             
@@ -457,7 +461,11 @@ def cmd_put(args):
                     total_expected_bytes += os.path.getsize(os.path.join(root, f))
                     
             total_bytes = 0
-            for root, dirs, files in os.walk(src):
+            import contextlib as _ctxlib
+            bulk_ctx = (vol.bulk() if getattr(args, "bulk", False)
+                        and hasattr(vol, "bulk") else _ctxlib.nullcontext())
+            with bulk_ctx:
+              for root, dirs, files in os.walk(src):
                 dirs[:] = [d for d in dirs]
                 rel = os.path.relpath(root, src)
                 if rel != ".":
@@ -1278,9 +1286,15 @@ def main(argv=None):
     p.add_argument("-r", "--recursive", action="store_true")
     p.add_argument("--comment")
     p.add_argument("--protect", help="e.g. 'hsparwed' subset like '----rwed'")
+    p.add_argument("--bulk", action="store_true",
+                   help="batch metadata commits for mass imports (faster; "
+                        "a crash mid-run may need `repair --write`)")
     p.set_defaults(func=cmd_put)
 
     p = sub.add_parser("cp", help="copy files between images (streaming)")
+    p.add_argument("--bulk", action="store_true",
+                   help="batch metadata commits for mass copies (faster; "
+                        "a crash mid-run may need `repair --write`)")
     p.add_argument("src_image")
     p.add_argument("src_path")
     p.add_argument("dst_image")

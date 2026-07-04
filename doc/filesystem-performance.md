@@ -131,8 +131,8 @@ column names the change chiefly responsible for each row's movement.
 | Engine | write | % of SSD | read | % of SSD | vs. baseline | principal contributor |
 |---|---|---|---|---|---|---|
 | OFS (DOS\0) | 34 MB/s | 1.5% | 418 MB/s | 7.2% | ×1.4 w, ×2.2 r | read-side run coalescing; writes remain bound by per-block header checksums (format property) |
-| FFS (DOS\3) | 647 MB/s | 29% | 987 MB/s | 17% | ×5.5 w, ×4.0 r | run coalescing ([fix #4](#4-the-syscall-storm)) compounded by O(1) free count ([fix #3](#3-the-bulk-import-slowdown)) |
-| FFS (4 K blocks) | 1 936 MB/s | 87% | 2 137 MB/s | 37% | ×2.9 w, ×2.7 r | same changes; 8× fewer blocks per MB leaves less per-block work to remove |
+| FFS (DOS\3) | 815 MB/s | 37% | 1 619 MB/s | 28% | ×7.0 w, ×6.5 r | run coalescing ([fix #4](#4-the-syscall-storm)) + O(1) free count ([fix #3](#3-the-bulk-import-slowdown)) + whole-table struct pack/unpack of block-pointer tables |
+| FFS (4 K blocks) | 2 127 MB/s | 96% | 2 260 MB/s | 39% | ×3.2 w, ×2.9 r | same changes; at 96% of the host ceiling the engine is no longer the bottleneck |
 | FFS-DC (DOS\5) | 639 MB/s | 29% | 973 MB/s | 17% | ×5.5 w, ×4.0 r | shares the FFS data path; dircache cost applies to metadata ops, not bulk data |
 | FFS-LNFS (DOS\7) | 566 MB/s | 26% | 947 MB/s | 16% | ×4.8 w, ×3.8 r | shares the FFS data path; slight deficit from long-name field handling |
 | PFS3 | 328 MB/s | 15% | 2 883 MB/s | 50% | unchanged | format is extent-based; had run-shaped I/O from the start |
