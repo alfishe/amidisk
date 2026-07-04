@@ -577,14 +577,28 @@ class PFS3Volume:
                 continue
             if wrapped and blk >= (self._roving if start <= self._roving < total else start):
                 break
-            # skip fully-allocated 32-block words at word-compare speed
+            # word-granular fast paths: skip fully-used words, grab
+            # fully-free words as 32 blocks in one operation
             if (blk - start) % 32 == 0 and blk + 32 <= total:
                 seq, off, _ = self._main_bit(blk)
-                _, praw = self._get_bmb(seq)
-                if struct.unpack_from(">I", praw, 12 + off * 4)[0] == 0:
+                bmblk, praw = self._get_bmb(seq)
+                word = struct.unpack_from(">I", praw, 12 + off * 4)[0]
+                if word == 0:
                     if run_n:
                         runs.append((run_s, run_n))
                         run_n = 0
+                    blk += 32
+                    continue
+                if word == 0xFFFFFFFF and got + 32 <= count:
+                    struct.pack_into(">I", praw, 12 + off * 4, 0)
+                    self._bmb_dirty.add(seq)
+                    if run_n and run_s + run_n == blk:
+                        run_n += 32
+                    else:
+                        if run_n:
+                            runs.append((run_s, run_n))
+                        run_s, run_n = blk, 32
+                    got += 32
                     blk += 32
                     continue
             if self._block_is_free(blk):
@@ -854,9 +868,34 @@ class PFS3Volume:
             off += raw[off]
         return off
 
+    def _entry_name(self, entry_bytes):
+        nlen = entry_bytes[17]
+        return bytes(entry_bytes[18 : 18 + nlen])
+
     def _add_entry(self, dir_entry, entry_bytes):
-        """Insert a built direntry into directory `dir_entry` (an SFSEntry-
-        style PFS3Entry with .anode = dir identity)."""
+        """Insert a built direntry into directory `dir_entry`.
+
+        A per-directory tail cache (last dirblock + end offset) makes
+        repeated inserts O(1): the handler's own policy of filling any
+        block with room is kept as the slow path when the cache is cold."""
+        tails = getattr(self, "_dir_tail", None)
+        if tails is None:
+            tails = self._dir_tail = {}
+        tail = tails.get(dir_entry.anode)
+        if tail is not None:
+            nr, bn, end = tail
+            if end + len(entry_bytes) + 1 <= self.reserved_blksize:
+                raw = bytearray(self._read_reserved(bn))
+                if self._entries_end(raw) == end:  # sanity vs stale cache
+                    raw[end : end + len(entry_bytes)] = entry_bytes
+                    if end + len(entry_bytes) < self.reserved_blksize:
+                        raw[end + len(entry_bytes)] = 0
+                    self._write_reserved(bn, raw)
+                    tails[dir_entry.anode] = (nr, bn, end + len(entry_bytes))
+                    self._dir_names(dir_entry.anode).add(
+                        self._upper_key(self._entry_name(entry_bytes)))
+                    return
+            tails.pop(dir_entry.anode, None)
         chain = self._dir_chain(dir_entry.anode)
         parent_of_dir = self._dirblock_parent(dir_entry.anode)
         for nr, bn in chain:
@@ -867,6 +906,9 @@ class PFS3Volume:
                 if end + len(entry_bytes) < self.reserved_blksize:
                     raw[end + len(entry_bytes)] = 0
                 self._write_reserved(bn, raw)
+                tails[dir_entry.anode] = (nr, bn, end + len(entry_bytes))
+                self._dir_names(dir_entry.anode).add(
+                    self._upper_key(self._entry_name(entry_bytes)))
                 return
         # extend the directory with a fresh dirblock at the chain tail
         newblk = self._alloc_reserved()
@@ -880,6 +922,9 @@ class PFS3Volume:
                          dir_entry.anode, parent_of_dir)
         raw[20 : 20 + len(entry_bytes)] = entry_bytes
         self._write_reserved(newblk, raw)
+        tails[dir_entry.anode] = (newnr, newblk, 20 + len(entry_bytes))
+        self._dir_names(dir_entry.anode).add(
+            self._upper_key(self._entry_name(entry_bytes)))
 
     def _dirblock_parent(self, dir_anodenr):
         if dir_anodenr == ANODE_ROOTDIR:
@@ -890,8 +935,45 @@ class PFS3Volume:
         raw = self._read_reserved(chain[0][1])
         return struct.unpack_from(">I", raw, 16)[0]
 
+    def _upper_key(self, name):
+        return bytes(self._upper(c) for c in name)
+
+    def _dir_names(self, dir_anodenr):
+        """Cached set of (case-folded) names in a directory. Lets mass
+        imports answer 'does this name exist?' without re-parsing every
+        entry per insert."""
+        idx = getattr(self, "_dir_index", None)
+        if idx is None:
+            idx = self._dir_index = {}
+        names = idx.get(dir_anodenr)
+        if names is None:
+            names = set()
+            for nr, bn in self._dir_chain(dir_anodenr):
+                raw = self._read_reserved(bn)
+                off = 20
+                while off < self.reserved_blksize and raw[off]:
+                    nlen = raw[off + 17]
+                    names.add(self._upper_key(bytes(raw[off + 18 : off + 18 + nlen])))
+                    off += raw[off]
+            idx[dir_anodenr] = names
+        return names
+
+    def _dir_cache_drop(self, dir_anodenr=None):
+        if getattr(self, "_dir_index", None):
+            if dir_anodenr is None:
+                self._dir_index.clear()
+            else:
+                self._dir_index.pop(dir_anodenr, None)
+        if getattr(self, "_dir_tail", None):
+            if dir_anodenr is None:
+                self._dir_tail.clear()
+            else:
+                self._dir_tail.pop(dir_anodenr, None)
+
     def _locate_entry(self, dir_anodenr, name):
         """(blocknr, offset, entry) of `name` in the directory, or None."""
+        if self._upper_key(bytes(name)) not in self._dir_names(dir_anodenr):
+            return None
         for nr, bn in self._dir_chain(dir_anodenr):
             raw = self._read_reserved(bn)
             off = 20
@@ -906,6 +988,12 @@ class PFS3Volume:
         loc = self._locate_entry(dir_anodenr, name)
         if loc is None:
             raise FSError("entry not found: %r" % name)
+        # compaction shifts offsets and may unlink blocks: keep the name
+        # set current, drop the tail hint for this directory
+        if getattr(self, "_dir_index", None) and dir_anodenr in self._dir_index:
+            self._dir_index[dir_anodenr].discard(self._upper_key(bytes(name)))
+        if getattr(self, "_dir_tail", None):
+            self._dir_tail.pop(dir_anodenr, None)
         bn, off, e = loc
         raw = bytearray(self._read_reserved(bn))
         size = raw[off]
@@ -953,6 +1041,7 @@ class PFS3Volume:
                          anodenr, parent.anode)
         self._write_reserved(dirblk, raw)
         self._save_anode(anodenr, 1, dirblk, 0)
+        self._dir_cache_drop(anodenr)
         entry = self._build_direntry(ST_USERDIR, anodenr, 0, name)
         self._add_entry(parent, entry)
         self._commit()
@@ -995,15 +1084,22 @@ class PFS3Volume:
             if nblocks:
                 runs = self._alloc_main(nblocks)
                 # write data
-                if isinstance(data, bytes):
+                if isinstance(data, (bytes, bytearray, memoryview)):
+                    # zero-copy: write source views directly; pad only the
+                    # final partial block (one small copy)
+                    mv = memoryview(data)
+                    bpb = self.bytes_per_block
                     pos = 0
                     for s, n in runs:
-                        chunk = data[pos : pos + n * self.bytes_per_block]
-                        pad = n * self.bytes_per_block - len(chunk)
-                        if pad:
-                            chunk = bytes(chunk) + b"\x00" * pad
-                        self._write_raw(s, chunk)
-                        pos += n * self.bytes_per_block
+                        want = min(n * bpb, len(data) - pos)
+                        full = want - (want % bpb)
+                        if full:
+                            self._write_raw(s, mv[pos : pos + full])
+                        if want != full:
+                            tail = bytes(mv[pos + full : pos + want])
+                            tail += b"\x00" * (bpb - len(tail))
+                            self._write_raw(s + full // bpb, tail)
+                        pos += n * bpb
                 else:
                     iterator = iter(data)
                     buf_stream = bytearray()
@@ -1078,6 +1174,7 @@ class PFS3Volume:
                 self.delete(base + b"/" + ch.name, recursive=True)
             self._begin()
             # free the dir's own blocks + anodes
+            self._dir_cache_drop(entry.anode)
             for nr, bn in self._dir_chain(entry.anode):
                 self._free_reserved(bn)
             nr = entry.anode

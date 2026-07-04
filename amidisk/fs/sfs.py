@@ -505,16 +505,26 @@ class SFSVolume:
             raw = bytearray(self._read_block(bblock))
             
             while remaining > 0 and bit_offset < bits_per_block:
+                # byte-aligned middle of a long span: memset whole bytes
+                if bit_offset % 8 == 0 and remaining >= 8:
+                    nbytes = min(remaining, bits_per_block - bit_offset) // 8
+                    if nbytes:
+                        o = 12 + bit_offset // 8
+                        raw[o : o + nbytes] = (b"\xff" if free else b"\x00") * nbytes
+                        blk += nbytes * 8
+                        remaining -= nbytes * 8
+                        bit_offset += nbytes * 8
+                        continue
                 word_idx = bit_offset // 32
                 bit_in_word = bit_offset % 32
-                
+
                 w = struct.unpack_from(">I", raw, 12 + word_idx * 4)[0]
                 if free:
                     w |= (1 << (31 - bit_in_word))
                 else:
                     w &= ~(1 << (31 - bit_in_word))
                 struct.pack_into(">I", raw, 12 + word_idx * 4, w & 0xFFFFFFFF)
-                
+
                 blk += 1
                 remaining -= 1
                 bit_offset += 1
@@ -569,13 +579,25 @@ class SFSVolume:
         bits_per_block = (self.bs - 12) * 8
         words_per_block = (self.bs - 12) // 4
         blocks_bitmap = (self.total + bits_per_block - 1) // bits_per_block
-        
+
         cur_start = -1
         cur_count = 0
-        
-        for bitmap_idx in range(blocks_bitmap):
+
+        # roving start: resume where the last allocation ended instead of
+        # rescanning the used prefix of the bitmap on every call
+        start_idx = getattr(self, "_alloc_cursor", 0) // bits_per_block
+        if start_idx >= blocks_bitmap:
+            start_idx = 0
+        scan_order = list(range(start_idx, blocks_bitmap)) + list(range(start_idx))
+        for bitmap_idx in scan_order:
             if needed == 0:
                 break
+            if bitmap_idx == 0 and cur_count > 0:
+                # wrapped around: block numbers are no longer consecutive,
+                # close the open run before continuing at the disk start
+                chunks.append((cur_start, cur_count))
+                cur_count = 0
+                cur_start = -1
                 
             raw = self._read_block(self.bitmapbase + bitmap_idx)
             for word_idx in range(words_per_block):
@@ -585,7 +607,21 @@ class SFSVolume:
                 w = struct.unpack_from(">I", raw, 12 + word_idx * 4)[0]
                 if w == 0 and cur_count == 0:
                     continue
-                    
+                if w == 0xFFFFFFFF and needed >= 32:
+                    blk = bitmap_idx * bits_per_block + word_idx * 32
+                    if blk + 32 <= self.total:
+                        if cur_count and cur_start + cur_count == blk:
+                            cur_count += 32
+                        else:
+                            if cur_count:
+                                chunks.append((cur_start, cur_count))
+                            cur_start, cur_count = blk, 32
+                        needed -= 32
+                        if needed == 0:
+                            chunks.append((cur_start, cur_count))
+                            break
+                        continue
+
                 for bit_in_word in range(32):
                     blk = bitmap_idx * bits_per_block + word_idx * 32 + bit_in_word
                     if blk >= self.total:
@@ -612,7 +648,10 @@ class SFSVolume:
             
         for start_blk, c in chunks:
             self._mark_space(start_blk, c, free=False)
-            
+        if chunks:
+            last_s, last_c = chunks[-1]
+            self._alloc_cursor = last_s + last_c
+
         return chunks
 
     def _alloc_adminspace(self):
@@ -1289,7 +1328,8 @@ class SFSVolume:
         self._write_freeblocks()
 
     def _mark_space(self, start, count, free=True):
-        """Override: also maintains the RootInfo free-block counter."""
+        """Override: also maintains the RootInfo free-block counter.
+        Long aligned spans are filled byte-wise (memset speed)."""
         bits_per_block = (self.bs - 12) * 8
         blk = start
         remaining = count
@@ -1298,6 +1338,15 @@ class SFSVolume:
             bit_offset = blk % bits_per_block
             raw = bytearray(self._read_block(bblock))
             while remaining > 0 and bit_offset < bits_per_block:
+                if bit_offset % 8 == 0 and remaining >= 8:
+                    nbytes = min(remaining, bits_per_block - bit_offset) // 8
+                    if nbytes:
+                        o = 12 + bit_offset // 8
+                        raw[o : o + nbytes] = (b"\xff" if free else b"\x00") * nbytes
+                        blk += nbytes * 8
+                        remaining -= nbytes * 8
+                        bit_offset += nbytes * 8
+                        continue
                 word_idx, bit_in_word = bit_offset // 32, bit_offset % 32
                 w = struct.unpack_from(">I", raw, 12 + word_idx * 4)[0]
                 if free:
@@ -1503,8 +1552,48 @@ class SFSVolume:
             entry.objc_offset = 24
         return entry
 
+    def _upper_key(self, name):
+        if self.case_sensitive:
+            return bytes(name)
+        return bytes(self._upper(c) for c in name)
+
+    def _dir_names(self, parent):
+        """Cached set of (case-folded) names in a directory, so mass
+        imports can answer 'does this exist?' without re-parsing every
+        object per insert."""
+        idx = getattr(self, "_dir_index", None)
+        if idx is None:
+            idx = self._dir_index = {}
+        names = idx.get(parent.objectnode)
+        if names is None:
+            names = set()
+            block = parent.firstdirblock
+            guard = 0
+            while block:
+                guard += 1
+                if guard > MAX_CHAIN:
+                    raise FSError("cyclic container chain")
+                raw = self._read_checked(block, OBJC_ID)
+                for e in self._iter_container_objects(raw, block):
+                    names.add(self._upper_key(e.name))
+                block = struct.unpack_from(">I", raw, 16)[0]
+            idx[parent.objectnode] = names
+        return names
+
+    def _dir_cache_drop(self, objectnode=None):
+        for attr in ("_dir_index", "_dir_tail"):
+            c = getattr(self, attr, None)
+            if c:
+                if objectnode is None:
+                    c.clear()
+                else:
+                    c.pop(objectnode, None)
+
     def _locate(self, parent, name):
         """(container_blk, offset, entry) of name in parent, or None."""
+        parent = self._normalize_parent(parent)
+        if self._upper_key(bytes(name)) not in self._dir_names(parent):
+            return None
         block = parent.firstdirblock
         guard = 0
         while block:
@@ -1550,9 +1639,32 @@ class SFSVolume:
             raw += b"\x00"
         return bytes(raw)
 
+    def _obj_name(self, obj_data):
+        end = obj_data.index(b"\x00", 25)
+        return bytes(obj_data[25:end])
+
     def _insert_object(self, parent, obj_data):
-        """Insert object bytes into parent's container chain; returns blk."""
+        """Insert object bytes into parent's container chain; returns blk.
+        A per-directory tail cache (container + end offset) makes mass
+        inserts O(1) instead of walking the chain per object."""
         parent = self._normalize_parent(parent)
+        tails = getattr(self, "_dir_tail", None)
+        if tails is None:
+            tails = self._dir_tail = {}
+        tail = tails.get(parent.objectnode)
+        if tail is not None:
+            tblk, tend = tail
+            if tend + len(obj_data) + 2 <= self.bs:
+                raw = bytearray(self._read_block(tblk))
+                if (struct.unpack_from(">I", raw, 0)[0] == OBJC_ID
+                        and self._container_end(raw) == tend):
+                    raw[tend : tend + len(obj_data)] = obj_data
+                    self._write_block(tblk, raw)
+                    tails[parent.objectnode] = (tblk, tend + len(obj_data))
+                    self._dir_names(parent).add(
+                        self._upper_key(self._obj_name(obj_data)))
+                    return tblk
+            tails.pop(parent.objectnode, None)
         block = parent.firstdirblock
         if block == 0:
             block = self._alloc_adminspace()
@@ -1566,6 +1678,8 @@ class SFSVolume:
             praw = bytearray(self._read_block(parent.objc_block))
             struct.pack_into(">I", praw, parent.objc_offset + 16, block)
             self._write_block(parent.objc_block, praw)
+            tails[parent.objectnode] = (block, 24 + len(obj_data))
+            self._dir_names(parent).add(self._upper_key(self._obj_name(obj_data)))
             return block
         guard = 0
         while True:
@@ -1577,6 +1691,8 @@ class SFSVolume:
             if end + len(obj_data) + 2 <= self.bs:
                 raw[end : end + len(obj_data)] = obj_data
                 self._write_block(block, raw)
+                tails[parent.objectnode] = (block, end + len(obj_data))
+                self._dir_names(parent).add(self._upper_key(self._obj_name(obj_data)))
                 return block
             nxt = struct.unpack_from(">I", raw, 16)[0]
             if nxt == 0:
@@ -1591,6 +1707,8 @@ class SFSVolume:
                 self._write_block(newblk, nraw)
                 struct.pack_into(">I", raw, 16, newblk)
                 self._write_block(block, raw)
+                tails[parent.objectnode] = (newblk, 24 + len(obj_data))
+                self._dir_names(parent).add(self._upper_key(self._obj_name(obj_data)))
                 return newblk
             block = nxt
 
@@ -1598,6 +1716,10 @@ class SFSVolume:
         """Remove the object's bytes from its container; compacts, and
         unlinks empty non-head containers."""
         parent = self._normalize_parent(parent)
+        if getattr(self, "_dir_index", None) and parent.objectnode in self._dir_index:
+            self._dir_index[parent.objectnode].discard(self._upper_key(entry.name))
+        if getattr(self, "_dir_tail", None):
+            self._dir_tail.pop(parent.objectnode, None)
         raw = bytearray(self._read_block(entry.objc_block))
         off = entry.objc_offset
         size = 25 + len(entry.name) + 1 + len(entry.comment) + 1
@@ -1793,6 +1915,24 @@ class SFSVolume:
 
     def _stream_into(self, data, size, chunks):
         if isinstance(data, (bytes, bytearray, memoryview)):
+            # zero-copy fast path: write memoryview slices directly; only
+            # the final partial block needs padding (and thus one copy)
+            mv = memoryview(data)
+            pos = 0
+            for s, c in chunks:
+                want = min(c * self.bs, size - pos)
+                full = want - (want % self.bs)
+                if full:
+                    self.dev.write(s * self.spb, mv[pos : pos + full])
+                if want != full:
+                    tail = bytes(mv[pos + full : pos + want])
+                    tail += b"\x00" * (self.bs - len(tail))
+                    self.dev.write((s + full // self.bs) * self.spb, tail)
+                pos += want
+            if pos < size:
+                raise FSError("stream ended prematurely")
+            return
+        if False:
             it = iter([bytes(data)])
         elif hasattr(data, "read"):
             def _gen(fh):
@@ -1828,6 +1968,7 @@ class SFSVolume:
         if self._locate(parent, name):
             raise FSError("already exists: %s" % path)
         nodeno = self._alloc_objectnode()
+        self._dir_cache_drop(nodeno)
         obj = self._build_object(name, nodeno, 0, 0, 0, OTYPE_DIR)
         blk = self._insert_object(parent, obj)
         h16 = _sfs_hash(name, self.case_sensitive)
@@ -1921,6 +2062,7 @@ class SFSVolume:
             self._free_adminspace(entry.data)  # SLNK block
         self._hash_remove(parent, entry)
         self._free_objectnode(entry.objectnode)
+        self._dir_cache_drop(entry.objectnode)
         self._remove_object(parent, entry)
 
     def rename(self, src, dst):

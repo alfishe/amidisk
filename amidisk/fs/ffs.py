@@ -993,21 +993,40 @@ class FFSVolume:
                     return chunk
 
             MAX_RUN = max(1, (4 << 20) // self.bs)  # cap run buffers at 4 MB
+            fully_contig = (ndata > 0
+                            and data_blks[-1] - data_blks[0] + 1 == ndata)
             i = 0
             while i < ndata:
                 # extend the run while block numbers stay consecutive
-                j = i + 1
-                while (j < ndata and j - i < MAX_RUN
-                       and data_blks[j] == data_blks[j - 1] + 1):
-                    j += 1
+                if fully_contig:
+                    j = min(ndata, i + MAX_RUN)
+                else:
+                    j = i + 1
+                    while (j < ndata and j - i < MAX_RUN
+                           and data_blks[j] == data_blks[j - 1] + 1):
+                        j += 1
                 want = min((j - i) * data_bytes, size - i * data_bytes)
-                payload = pull(want)
-                if self.ffs:
+                if self.ffs and isinstance(data, (bytes, bytearray, memoryview)):
+                    # zero-copy: full blocks straight from the source view
+                    base = i * data_bytes
+                    full = want - (want % self.bs)
+                    if full:
+                        self.dev.write(data_blks[i] * self.spb,
+                                       src[base : base + full])
+                    if want != full:
+                        tail = bytes(src[base + full : base + want])
+                        tail += b"\x00" * (self.bs - len(tail))
+                        self.dev.write(
+                            (data_blks[i] + full // self.bs) * self.spb, tail)
+                    pos[0] = base + want
+                elif self.ffs:
+                    payload = pull(want)
                     pad = (j - i) * self.bs - len(payload)
                     if pad:
                         payload += b"\x00" * pad
                     self.dev.write(data_blks[i] * self.spb, payload)
                 else:
+                    payload = pull(want)
                     run = bytearray((j - i) * self.bs)
                     for k in range(i, j):
                         chunk = payload[(k - i) * data_bytes :
@@ -1026,25 +1045,42 @@ class FFSVolume:
                     self.dev.write(data_blks[i] * self.spb, bytes(run))
                 i = j
 
-            # extension blocks (written last-to-first to know the next pointer)
-            next_ext_ptr = 0
-            for x in range(next_blocks - 1, -1, -1):
-                blk = ext_blks[x]
-                part = data_blks[self.tsz * (x + 1) : self.tsz * (x + 2)]
-                buf = BlockBuf(None, self.bs)
-                buf.put_long(0, T_LIST)
-                buf.put_long(1, blk)
-                buf.put_long(2, len(part))
-                if part:  # table is stored reversed; pack it in one call
-                    lo = 24 + (self.tsz - len(part)) * 4
-                    buf.data[lo : 24 + self.tsz * 4] = struct.pack(
-                        ">%dI" % len(part), *reversed(part))
-                buf.put_long(-3, hdr_blk)
-                buf.put_long(-2, next_ext_ptr)
-                buf.put_slong(-1, ST_FILE)
-                buf.fix_checksum()
-                self.write_buf(blk, buf)
-                next_ext_ptr = blk
+            # extension blocks: next-pointers are known up front, so
+            # build consecutive blocks in one buffer per run and write
+            # each run with a single call (5 700 blocks -> ~60 writes
+            # on a 200 MB file at 512-byte blocks)
+            bs, nl, tsz = self.bs, self.nl, self.tsz
+            # all tables are slices of the pointer list in descending
+            # order: pack it once, slice per block (no per-table tuples)
+            desc = struct.pack(">%dI" % ndata, *data_blks[::-1]) if ndata else b""
+
+            def table_bytes(a, b):
+                return desc[(ndata - b) * 4 : (ndata - a) * 4]
+
+            x = 0
+            while x < next_blocks:
+                y = x + 1
+                while (y < next_blocks and y - x < 8192
+                       and ext_blks[y] == ext_blks[y - 1] + 1):
+                    y += 1
+                run = bytearray((y - x) * bs)
+                for k in range(x, y):
+                    o = (k - x) * bs
+                    a = tsz * (k + 1)
+                    b = min(tsz * (k + 2), ndata)
+                    struct.pack_into(">3I", run, o, T_LIST, ext_blks[k], b - a)
+                    if b > a:
+                        lo = o + 24 + (tsz - (b - a)) * 4
+                        run[lo : o + 24 + tsz * 4] = table_bytes(a, b)
+                    struct.pack_into(
+                        ">II", run, o + bs - 12, hdr_blk,
+                        ext_blks[k + 1] if k + 1 < next_blocks else 0)
+                    struct.pack_into(">i", run, o + bs - 4, ST_FILE)
+                    csum = sum(struct.unpack_from(">%dI" % nl, run, o))
+                    struct.pack_into(">I", run, o + 20, (-csum) & 0xFFFFFFFF)
+                self.dev.write(ext_blks[x] * self.spb, bytes(run))
+                x = y
+            next_ext_ptr = ext_blks[0] if ext_blks else 0
 
             # file header
             buf = self._new_header(hdr_blk, ST_FILE, parent.blk, name, protect, comment)
@@ -1053,10 +1089,9 @@ class FFSVolume:
             head = data_blks[: self.tsz]
             buf.put_long(2, len(head))
             buf.put_long(4, data_blks[0] if data_blks else 0)
-            if head:  # table is stored reversed; pack it in one call
+            if head:  # table is stored reversed; slice the packed pointers
                 lo = 24 + (self.tsz - len(head)) * 4
-                buf.data[lo : 24 + self.tsz * 4] = struct.pack(
-                    ">%dI" % len(head), *reversed(head))
+                buf.data[lo : 24 + self.tsz * 4] = table_bytes(0, len(head))
             buf.put_long(-47, size)
             buf.put_long(-2, next_ext_ptr)
             buf.fix_checksum()
