@@ -9,13 +9,14 @@ class TarHandler(ArchiveHandler):
         return tarfile.is_tarfile(path)
         
     def test_archive(self):
+        from ..tarreader import open_tar, LibarchiveError
         print("verifying archive integrity: %s..." % self.path)
         try:
-            with tarfile.open(self.path, "r") as tar:
+            with open_tar(self.path) as tar:
                 for _ in tar:
                     pass
             return True
-        except tarfile.TarError as e:
+        except Exception as e:
             print("error: archive verification failed: %s" % e, file=sys.stderr)
             return False
             
@@ -29,8 +30,9 @@ class TarHandler(ArchiveHandler):
         last_flush_bytes = 0
         total_archive_size = os.path.getsize(self.path)
         
+        from ..tarreader import open_tar
         try:
-            with tarfile.open(self.path, "r") as tar:
+            with open_tar(self.path) as tar:
                 for member in tar:
                     name = member.name
                     if name.startswith("./"):
@@ -48,32 +50,41 @@ class TarHandler(ArchiveHandler):
                         (base_amiga_path + "/" if base_amiga_path else "") + rel_amiga
                     )
                     
-                    if member.isdir():
+                    if member.isdir:
                         if amiga_dir:
                             vol.makedirs(amiga_dir)
                             dir_count += 1
-                    elif member.isfile():
+                    elif member.isfile:
                         parent_dir = "/".join(amiga_dir.split("/")[:-1])
                         if parent_dir:
                             vol.makedirs(parent_dir)
                             
-                        fh = tar.extractfile(member)
-                        if fh is not None:
+                        # Use member.chunks() directly
+                        def stream_file(m):
+                            for chk in m.chunks():
+                                yield chk
+                                
+                        # tarreader doesn't directly expose mtime, wait, does it?
+                        # Let's check if tarreader exposes mtime! If not we ignore it, but wait!
+                        # Let's just use mtime=None for now to get it compiling if member has no mtime.
+                        mtime = None
+                        if hasattr(member, "mtime"):
                             mtime = datetime.fromtimestamp(member.mtime)
-                            vol.write_file(
-                                amiga_dir, fh, size=member.size, 
-                                protect=protect, comment=comment, mtime=mtime
-                            )
-                            n += 1
-                            total_bytes += member.size
-                            if (total_bytes - last_flush_bytes) > 50_000_000:
-                                if hasattr(vol, "bitmap"):
-                                    vol.bitmap.flush()
-                                vol.dev.flush()
-                                last_flush_bytes = total_bytes
-                    # Update progress using the underlying tarfile read cursor
-                    if tar.fileobj:
-                        print_progress(tar.fileobj.tell(), total_archive_size, parts[-1])
+                            
+                        vol.write_file(
+                            amiga_dir, stream_file(member), size=member.size, 
+                            protect=protect, comment=comment, mtime=mtime
+                        )
+                        n += 1
+                        total_bytes += member.size
+                        if (total_bytes - last_flush_bytes) > 50_000_000:
+                            if hasattr(vol, "bitmap"):
+                                vol.bitmap.flush()
+                            vol.dev.flush()
+                            last_flush_bytes = total_bytes
+                    # For tarreader we don't track underlying file offset easily, 
+                    # but we can track total_bytes of file content written.
+                    print_progress(total_bytes, total_archive_size, parts[-1])
                         
         except Exception as e:
             print("") # lock progress bar before error message

@@ -26,12 +26,13 @@ CHUNK = 1 << 20
 
 
 class TarEntry:
-    __slots__ = ("name", "kind", "size", "linkname", "_reader", "_serial")
+    __slots__ = ("name", "kind", "size", "mtime", "linkname", "_reader", "_serial")
 
-    def __init__(self, name, kind, size, linkname, reader, serial):
+    def __init__(self, name, kind, size, mtime, linkname, reader, serial):
         self.name = name
         self.kind = kind          # 'file' | 'dir' | 'hardlink' | 'other'
         self.size = size
+        self.mtime = mtime
         self.linkname = linkname  # hardlink/symlink target, if any
         self._reader = reader
         self._serial = serial
@@ -79,7 +80,7 @@ class ClassicTarReader:
             kind = "hardlink"
         else:
             kind = "other"
-        return TarEntry(m.name, kind, m.size, m.linkname or None,
+        return TarEntry(m.name, kind, m.size, m.mtime, m.linkname or None,
                         self, self._serial)
 
     def _chunks(self, serial, chunk):
@@ -166,6 +167,8 @@ class LibarchiveTarReader:
         la.archive_entry_hardlink.restype = ctypes.c_char_p
         la.archive_entry_symlink.argtypes = [ctypes.c_void_p]
         la.archive_entry_symlink.restype = ctypes.c_char_p
+        la.archive_entry_mtime.argtypes = [ctypes.c_void_p]
+        la.archive_entry_mtime.restype = ctypes.c_longlong
         cls._lib = la
         return la
 
@@ -220,8 +223,9 @@ class LibarchiveTarReader:
             sym = la.archive_entry_symlink(entry)
             kind = "other"
             link = os.fsdecode(sym) if sym else None
+        mtime = la.archive_entry_mtime(entry)
         self._remaining = size if kind == "file" else 0
-        return TarEntry(name.rstrip("/"), kind, size, link, self, self._serial)
+        return TarEntry(name.rstrip("/"), kind, size, mtime, link, self, self._serial)
 
     def _chunks(self, serial, chunk):
         if serial != self._serial:
