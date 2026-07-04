@@ -12,6 +12,7 @@ license = { text = "MIT" }
 
 [project.scripts]
 amidisk = "amidisk.cli:main"
+amidisk-sync = "amidisk.sync:main"
 
 [tool.setuptools.packages.find]
 include = ["amidisk*"]
