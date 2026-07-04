@@ -82,12 +82,12 @@ Here is where our baseline performance started. After proving the mathematical c
 | Engine | write | % of device | read | % of device | create f/s | notes |
 |---|---|---|---|---|---|---|
 | OFS (DOS\0) | 36 MB/s | 1% | 433 MB/s | 15% | 2290 | format-bound: per-block embedded checksummed headers |
-| FFS (DOS\3) | 1945 MB/s | 63% | 1978 MB/s | 70% | 4625 | at the 512-byte format floor: 5 690 interleaved pointer tables per 200 MB |
+| FFS (DOS\3) | 1945 MB/s | 63% | ~2 250 MB/s | 79-80% | 4625 | reads at target within noise; residual is the ext-table walk |
 | FFS (4 K blocks) | 2791 MB/s | 90% | 2434 MB/s | 86% | 2149 | the format's own answer to the 512 B floor -- target met both directions |
 | FFS-DC (DOS\5) | 1904 MB/s | 62% | 1999 MB/s | 71% | 842 | FFS data path; dircache costs hit creates only |
-| FFS-LNFS (DOS\7) | 1810 MB/s | 58% | 1900 MB/s | 67% | 4515 | FFS data path + long-name handling |
-| PFS3 | 2649 MB/s | 86% | 2449 MB/s | 87% | 4498 | target met both directions |
-| SFS | 2730 MB/s | 88% | 2503 MB/s | 89% | 2105 | adjacent 32 MB extent records merge into one read at read time |
+| FFS-LNFS (DOS\7) | 1810 MB/s | 58% | ~2 230 MB/s | 78-81% | 4515 | FFS data path + long-name handling |
+| PFS3 | 2649 MB/s | 86% | ~2 800 MB/s | 100% | 4498 | reads at raw-device parity |
+| SFS | 2730 MB/s | 88% | ~2 840 MB/s | 101% | 2105 | extent merging + parallel fill: reads at raw-device parity |
 
 Looking at this baseline data, we can draw three major conclusions about how the raw filesystem architectures limit performance:
 
@@ -175,8 +175,23 @@ measurement after a heavy write burst reads ~40-60% slow while the
 drive recovers -- interleave and take medians, or the comparison is
 fiction.
 
-**The 80%-of-raw target.** Met for both directions by FFS 4 K, PFS3,
-and SFS. (SFS reads initially plateaued at 77%: the format's u16
+**Third read round (what actually moved the needle).** Phase
+instrumentation of the FFS cold read found the suspected hidden
+bottlenecks: bitmap pages were loaded with one small device read per
+page at mount (~516 for a 1 GB volume; now batched), one giant
+buffered read is *slower* than chunked reads (readall reallocation --
+all large reads now use parallel 16 MB positional reads), a
+bytearray's upfront zero-fill costs 20 ms per 200 MB (replaced with
+anonymous mmap buffers the kernel lazy-zeroes), and unaligned
+F_NOCACHE I/O silently loses the kernel's direct path (all three
+allocators now start large runs 4 K-aligned). Read percentages are
+same-round ratios against a baseline measured in the same round --
+absolute MB/s drifts +-15% with drive state, the ratio does not. No
+contiguity assumptions anywhere: only table- or extent-verified runs
+are read.
+
+**The 80%-of-raw target.** Met for both directions by FFS 4 K, PFS3
+(reads now at 100% -- raw parity), and SFS (101%). (SFS reads initially plateaued at 77%: the format's u16
 extent field splits large files into 32 MB records. But the records
 are physically adjacent on disk, so merging them at read time restored
 the single-read path -- 89%, indistinguishable from PFS3 in an
