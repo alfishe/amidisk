@@ -1212,18 +1212,58 @@ class FFSVolume:
         return blk
 
     def makedirs(self, path):
+        """Create the full directory path, skipping segments that already exist.
+
+        Unlike the old implementation which called resolve() from root for every
+        segment (O(depth²) device reads), this walks segment-by-segment using the
+        _dircache and _dir_name_set for O(1) existence checks, updating the cache
+        as new directories are created so deeper segments find their parents cached.
+        """
         parts = self._split(path)
-        cur = b""
+        if not parts:
+            return
+
+        # Start from root
+        cache = getattr(self, "_dircache", None)
+        if cache is None:
+            cache = self._dircache = {}
+
+        cur_blk = self.root_blk
+        cur_path_parts = []
+
         for seg in parts:
-            cur = cur + b"/" + seg if cur else seg
-            try:
-                e = self.resolve(cur)
-                if not e.is_dir():
-                    raise FSError("'%s' exists and is not a directory" % cur.decode("latin-1"))
-            except FSError as ex:
-                if "not found" not in str(ex):
-                    raise
-                self.mkdir(cur)
+            cur_path_parts.append(seg)
+            key = b"/".join(cur_path_parts)
+
+            # Fast path: cached dir block
+            cached_blk = cache.get(key)
+            if cached_blk is not None:
+                cur_blk = cached_blk
+                continue
+
+            # Check if segment exists in parent dir via name set (O(1) after first scan)
+            cur_buf = self.read_buf(cur_blk)
+            name_set = self._dir_name_set(cur_buf)
+            folded = self._fold(bytes(seg))
+
+            if folded in name_set:
+                # Exists: find its block via hash chain (fast: usually 1 read)
+                child = self._find_in_dir(cur_buf, seg)
+                if child is None:
+                    raise FSError("makedirs: '%s' exists but unreadable" %
+                                  seg.decode("latin-1", errors="replace"))
+                if not child.is_dir():
+                    raise FSError("'%s' exists and is not a directory" %
+                                  key.decode("latin-1", errors="replace"))
+                cur_blk = child.blk
+                if len(cache) < 65536:
+                    cache[key] = cur_blk
+            else:
+                # Does not exist: create it
+                new_blk = self.mkdir(key)
+                if len(cache) < 65536:
+                    cache[key] = new_blk
+                cur_blk = new_blk
 
     def write_file(self, path, data, size=None, protect=0, comment=b"", mtime=None):
         """Create or replace a file with `data` (bytes or iterator of bytes)."""

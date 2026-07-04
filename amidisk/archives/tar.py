@@ -82,5 +82,8 @@ class TarHandler(ArchiveHandler):
             print("error: streaming interrupted: %s" % e, file=sys.stderr)
             raise
             
-        print("") # newline to lock progress bar
+        # Force final 100% update (throttle may have skipped the last real update)
+        print_progress._last_t = 0  # reset throttle so it always fires
+        print_progress(total_bytes, total_bytes, "")
+        print("")  # newline to lock progress bar
         return n, dir_count, total_bytes
