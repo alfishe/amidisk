@@ -39,11 +39,20 @@ def print_progress(current_bytes, total_bytes, current_file=""):
     filled = int((percent / 100) * bar_len) if percent <= 100 else bar_len
     bar = '#' * filled + '-' * (bar_len - filled)
     
-    # \x1b[2K clears the entire current line, \r returns cursor to the beginning
     sys.stdout.write("\x1b[2K\r[%s] %5.1f%% (%s / %s) %s" % (
         bar, percent, human_size(current_bytes), human_size(total_bytes), current_file[:40]
     ))
     sys.stdout.flush()
+
+def print_transfer_stats(file_count, dir_count, total_bytes, elapsed):
+    sys.stdout.write("\x1b[2K\r")
+    if elapsed <= 0: elapsed = 0.001
+    speed = (total_bytes / 1024.0 / 1024.0) / elapsed
+    print("Transferred: %d files, %d dirs" % (file_count, dir_count))
+    print("Total size:  %s" % human_size(total_bytes))
+    print("Time taken:  %.2f seconds" % elapsed)
+    print("Avg speed:   %.2f MB/s" % speed)
+
 
 
 def human_size(n):
@@ -298,8 +307,10 @@ def cmd_extract(args):
         if entry.is_file():
             if os.path.isdir(dest):
                 dest = os.path.join(dest, _safe_name(entry.name_str()))
+            start_time = time.time()
             _extract_file(vol, path, entry, dest)
-            print("extracted %s (%d bytes)" % (dest, entry.size))
+            elapsed = time.time() - start_time
+            print_transfer_stats(1, 0, entry.size, elapsed)
             return 0
         if not args.recursive:
             print("error: %s is a directory (use -r)" % (path or "volume root"),
@@ -310,18 +321,26 @@ def cmd_extract(args):
         )
         os.makedirs(dest, exist_ok=True)
         count = 0
+        dir_count = 0
+        total_bytes = 0
+        start_time = time.time()
         for prefix, e in vol.walk(path):
             rel = prefix[len(base_prefix):].lstrip("/") if base_prefix else prefix
             host_dir = os.path.join(dest, *[_safe_name(p) for p in rel.split("/") if p])
             if e.sec_type == 2:  # dir
                 os.makedirs(os.path.join(host_dir, _safe_name(e.name_str())), exist_ok=True)
+                dir_count += 1
             elif e.is_file():
                 os.makedirs(host_dir, exist_ok=True)
                 _extract_file(vol, None, e, os.path.join(host_dir, _safe_name(e.name_str())))
                 count += 1
+                total_bytes += e.size
+                print_progress(total_bytes, total_bytes, e.name_str())
             elif e.is_link():
-                print("skipping link: %s/%s" % (prefix, e.name_str()), file=sys.stderr)
-        print("extracted %d files to %s" % (count, dest))
+                print("\nskipping link: %s/%s" % (prefix, e.name_str()), file=sys.stderr)
+                
+        elapsed = time.time() - start_time
+        print_transfer_stats(count, dir_count, total_bytes, elapsed)
     return 0
 
 
@@ -376,6 +395,7 @@ def cmd_cp(args):
         start_time = time.time()
         total_bytes = 0
         file_count = 0
+        dir_count = 0
         
         entry = src_vol.resolve(src_path)
         if entry.is_file():
@@ -415,6 +435,7 @@ def cmd_cp(args):
             if e.is_dir():
                 dst_dir = amiga_dir + "/" + e.name_str() if amiga_dir else e.name_str()
                 dst_vol.makedirs(dst_dir)
+                dir_count += 1
             elif e.is_file():
                 if amiga_dir:
                     dst_vol.makedirs(amiga_dir)
@@ -425,7 +446,8 @@ def cmd_cp(args):
                 file_count += 1
                 print_progress(total_bytes, total_bytes, e.name_str())
                 
-        print("\nstreamed %d files (%d bytes)" % (file_count, total_bytes))
+        elapsed = time.time() - start_time
+        print_transfer_stats(file_count, dir_count, total_bytes, elapsed)
     return 0
 
 
@@ -488,10 +510,12 @@ def cmd_put(args):
                 return 1
             base = path.rstrip("/")
             try:
-                n, size = handler.stream_to_volume(
+                start_time = time.time()
+                n_files, n_dirs, size = handler.stream_to_volume(
                     vol, base, truncate_name, max_len, protect, comment
                 )
-                print("streamed %d files (%d bytes) from archive" % (n, size))
+                elapsed = time.time() - start_time
+                print_transfer_stats(n_files, n_dirs, size, elapsed)
                 return 0
             except Exception:
                 return 1

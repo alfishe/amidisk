@@ -24,6 +24,7 @@ class TarHandler(ArchiveHandler):
         import os
         
         n = 0
+        dir_count = 0
         total_bytes = 0
         last_flush_bytes = 0
         total_archive_size = os.path.getsize(self.path)
@@ -50,6 +51,7 @@ class TarHandler(ArchiveHandler):
                     if member.isdir():
                         if amiga_dir:
                             vol.makedirs(amiga_dir)
+                            dir_count += 1
                     elif member.isfile():
                         parent_dir = "/".join(amiga_dir.split("/")[:-1])
                         if parent_dir:
@@ -79,4 +81,4 @@ class TarHandler(ArchiveHandler):
             raise
             
         print("") # lock progress bar
-        return n, total_bytes
+        return n, dir_count, total_bytes
