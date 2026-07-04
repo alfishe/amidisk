@@ -16,16 +16,16 @@ created/listed/deleted, shallow `check`. Every result is taken after a
 deep-check pass confirms the volume is structurally valid — a fast
 engine that corrupts volumes has a performance of zero.
 
-## The baseline: how fast SSD performs for Python file I/O
+## The baseline: two ceilings — host I/O path vs the physical SSD
 
-Before any emulated filesystem-specific measurements, let's get an SSD performance baseline through the exact same stack (Python file I/O, same 200 MB payload, `fsync` on writes):
+Before any filesystem measurements, two baselines through the exact same stack (Python file I/O, same payload, `fsync` on writes): the host I/O path as the engines see it (cache-hot), and the physical device with the page cache bypassed on both the write and read side:
 
 | Access pattern | write | read | note |
 |---|---|---|---|
-| sequential, 4 MB chunks | **3 035 MB/s** | **6 637 MB/s** | the host ceiling — 100% below |
+| sequential, 4 MB chunks, page-cache-hot | **3 035 MB/s** | **6 637 MB/s** | host I/O-path ceiling; the read figure is RAM/page-cache speed, NOT the disk — this row is the 100% reference for engine percentages, because engine benchmarks are cache-hot too |
 | sequential, 512 B calls | 562 MB/s | 2 264 MB/s | 81% write loss, 66% read loss (syscall overhead) |
 | 512 B with seek per block | 195 MB/s | 1 253 MB/s | 94% write loss, 81% read loss (the legacy filesystem access pattern) |
-| physical device (`F_NOCACHE` both sides) | 3 230 MB/s | 2 622 MB/s | the TB4/NVMe itself — what real cold data can move at |
+| **physical device** (`F_NOCACHE` both sides) | **3 230 MB/s** | **2 622 MB/s** | the TB4/NVMe itself — the ceiling for real cold data; note reads are 2.5x SLOWER than the cached row above |
 
 Two different ceilings live in this table, and they must not be
 confused. The 4 MB-chunk row is the **host I/O path** ceiling: reads
