@@ -87,7 +87,7 @@ Here is where our baseline performance started. After proving the mathematical c
 | FFS-DC (DOS\5) | 1904 MB/s | 62% | 1999 MB/s | 71% | 842 | FFS data path; dircache costs hit creates only |
 | FFS-LNFS (DOS\7) | 1810 MB/s | 58% | 1900 MB/s | 67% | 4515 | FFS data path + long-name handling |
 | PFS3 | 2649 MB/s | 86% | 2449 MB/s | 87% | 4498 | target met both directions |
-| SFS | 2730 MB/s | 88% | 2182 MB/s | 77% | 2105 | reads capped by u16 extents (32 MB) forcing buffer assembly |
+| SFS | 2730 MB/s | 88% | 2503 MB/s | 89% | 2105 | adjacent 32 MB extent records merge into one read at read time |
 
 Looking at this baseline data, we can draw three major conclusions about how the raw filesystem architectures limit performance:
 
@@ -170,11 +170,17 @@ three interleaved rounds with the baseline re-measured each round
 (medians: 3 094 MB/s write, 2 819 MB/s read at 16 MB requests). The
 drive's own state contributes +-15% run-to-run variance -- single
 measurements at this precision are meaningless, which is why every
-figure here is a median with a same-round yardstick.
+figure here is a median with a same-round yardstick. The first
+measurement after a heavy write burst reads ~40-60% slow while the
+drive recovers -- interleave and take medians, or the comparison is
+fiction.
 
 **The 80%-of-raw target.** Met for both directions by FFS 4 K, PFS3,
-and SFS writes; SFS reads reach 77% (u16 extent size limit forces
-multi-buffer assembly). The 512-byte FFS variants plateau at 58-71%:
+and SFS. (SFS reads initially plateaued at 77%: the format's u16
+extent field splits large files into 32 MB records. But the records
+are physically adjacent on disk, so merging them at read time restored
+the single-read path -- 89%, indistinguishable from PFS3 in an
+interleaved A/B.) The 512-byte FFS variants plateau at 58-71%:
 that is the format floor, not engine overhead -- a 200 MB file
 requires 5 690 interleaved 72-entry pointer tables that must be built,
 checksummed, and written between the data runs. The format's own
