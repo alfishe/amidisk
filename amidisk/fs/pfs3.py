@@ -1088,7 +1088,14 @@ class PFS3Volume:
         parts = self._split(path)
         if not parts:
             raise FSError("empty path")
-        parent = self._resolve_dir(b"/".join(parts[:-1]))
+        key = b"/".join(parts[:-1])
+        if getattr(self, "_last_split_key", None) == key:
+            last_parent = getattr(self, "_last_split_parent", None)
+            if last_parent is not None:
+                return last_parent, parts[-1]
+        parent = self._resolve_dir(key)
+        self._last_split_key = key
+        self._last_split_parent = parent
         return parent, parts[-1]
 
     # -- public mutating API -------------------------------------------------
@@ -1111,6 +1118,10 @@ class PFS3Volume:
         return anodenr
 
     def makedirs(self, path):
+        if getattr(self, "_last_makedirs_path", None) == path:
+            return
+        self._last_makedirs_path = path
+
         parts = self._split(path)
         cur = b""
         for seg in parts:
@@ -1164,25 +1175,38 @@ class PFS3Volume:
                             self._write_raw(s + full // bpb, tail)
                         pos += n * bpb
                 else:
-                    iterator = iter(data)
-                    buf_stream = bytearray()
-                    remaining = size
-                    for s, n in runs:
-                        run_bytes = min(remaining, n * self.bytes_per_block)
-                        while len(buf_stream) < run_bytes:
-                            try:
-                                buf_stream += next(iterator)
-                            except StopIteration:
+                    if hasattr(data, "read"):
+                        remaining = size
+                        for s, n in runs:
+                            run_bytes = min(remaining, n * self.bytes_per_block)
+                            chunk = data.read(run_bytes)
+                            if len(chunk) < run_bytes:
                                 raise FSError("stream ended prematurely")
-                                
-                        chunk = bytes(buf_stream[:run_bytes])
-                        buf_stream = buf_stream[run_bytes:]
-                        
-                        pad = n * self.bytes_per_block - len(chunk)
-                        if pad:
-                            chunk = chunk + b"\x00" * pad
-                        self._write_raw(s, chunk)
-                        remaining -= run_bytes
+                            pad = n * self.bytes_per_block - len(chunk)
+                            if pad:
+                                chunk = chunk + b"\x00" * pad
+                            self._write_raw(s, chunk)
+                            remaining -= run_bytes
+                    else:
+                        iterator = iter(data)
+                        buf_stream = bytearray()
+                        remaining = size
+                        for s, n in runs:
+                            run_bytes = min(remaining, n * self.bytes_per_block)
+                            while len(buf_stream) < run_bytes:
+                                try:
+                                    buf_stream += next(iterator)
+                                except StopIteration:
+                                    raise FSError("stream ended prematurely")
+                                    
+                            chunk = bytes(buf_stream[:run_bytes])
+                            buf_stream = buf_stream[run_bytes:]
+                            
+                            pad = n * self.bytes_per_block - len(chunk)
+                            if pad:
+                                chunk = chunk + b"\x00" * pad
+                            self._write_raw(s, chunk)
+                            remaining -= run_bytes
 
                 # anode chain: one anode per run
                 cur = anodenr
@@ -1223,6 +1247,9 @@ class PFS3Volume:
 
     def delete(self, path, recursive=False):
         self._begin()
+        self._last_makedirs_path = None
+        self._last_split_key = None
+        self._last_split_parent = None
         entry = self.resolve(path) if not isinstance(path, PFS3Entry) else path
         if entry.anode == ANODE_ROOTDIR:
             raise FSError("cannot delete the root directory")
@@ -1279,6 +1306,9 @@ class PFS3Volume:
 
     def rename(self, src, dst):
         self._begin()
+        self._last_makedirs_path = None
+        self._last_split_key = None
+        self._last_split_parent = None
         entry = self.resolve(src)
         if entry.anode == ANODE_ROOTDIR:
             raise FSError("cannot rename the root directory")

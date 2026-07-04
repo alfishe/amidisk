@@ -1011,6 +1011,11 @@ class FFSVolume:
         cleared wholesale on delete/rename (rare during imports).
         """
         key = b"/".join(path_parts)
+        if getattr(self, "_last_resolved_key", None) == key:
+            last_entry = getattr(self, "_last_resolved_entry", None)
+            if last_entry is not None:
+                return last_entry
+
         cache = getattr(self, "_dircache", None)
         if cache is None:
             cache = self._dircache = {}
@@ -1018,11 +1023,16 @@ class FFSVolume:
         if blk is not None:
             e = Entry.parse(self.read_buf(blk), blk, self.is_longname)
             if e.is_dir():  # stale entries fall through to a full resolve
+                self._last_resolved_key = key
+                self._last_resolved_entry = e
                 return e
             del cache[key]
         e = self.resolve(key)
         if e.is_dir() and e.sec_type != ST_ROOT and len(cache) < 65536:
             cache[key] = e.blk
+        if e.is_dir():
+            self._last_resolved_key = key
+            self._last_resolved_entry = e
         return e
 
     def _resolve_parent(self, path):
@@ -1227,6 +1237,11 @@ class FFSVolume:
         _dircache and _dir_name_set for O(1) existence checks, updating the cache
         as new directories are created so deeper segments find their parents cached.
         """
+        self._require_writable()
+        if getattr(self, "_last_makedirs_path", None) == path:
+            return
+        self._last_makedirs_path = path
+
         parts = self._split(path)
         if not parts:
             return
@@ -1325,18 +1340,25 @@ class FFSVolume:
                         raise FSError("stream ended prematurely")
                     return chunk
             else:
-                it = iter(data)
-                sbuf = bytearray()
-
-                def pull(n):
-                    while len(sbuf) < n:
-                        try:
-                            sbuf.extend(next(it))
-                        except StopIteration:
+                if hasattr(data, "read"):
+                    def pull(n):
+                        chunk = data.read(n)
+                        if len(chunk) < n:
                             raise FSError("stream ended prematurely")
-                    chunk = bytes(sbuf[:n])
-                    del sbuf[:n]
-                    return chunk
+                        return chunk
+                else:
+                    it = iter(data)
+                    sbuf = bytearray()
+
+                    def pull(n):
+                        while len(sbuf) < n:
+                            try:
+                                sbuf.extend(next(it))
+                            except StopIteration:
+                                raise FSError("stream ended prematurely")
+                        chunk = bytes(sbuf[:n])
+                        del sbuf[:n]
+                        return chunk
 
             MAX_RUN = max(1, (16 << 20) // self.bs)
             if self.ffs:
@@ -1520,6 +1542,9 @@ class FFSVolume:
         self._unlink_entry(entry)
         if getattr(self, "_dircache", None):
             self._dircache.clear()
+        self._last_makedirs_path = None
+        self._last_resolved_key = None
+        self._last_resolved_entry = None
         if getattr(self, "_dir_names_cache", None):
             self._dir_names_cache.clear()
         self.bitmap.free(self._entry_blocks(entry))
@@ -1533,6 +1558,9 @@ class FFSVolume:
             raise FSError("cannot rename the root directory")
         if getattr(self, "_dircache", None):
             self._dircache.clear()
+        self._last_makedirs_path = None
+        self._last_resolved_key = None
+        self._last_resolved_entry = None
         if getattr(self, "_dir_names_cache", None):
             self._dir_names_cache.clear()
         new_parent, new_name = self._resolve_parent(dst)
