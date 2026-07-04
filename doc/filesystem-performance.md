@@ -128,15 +128,15 @@ State of all engines after the four optimizations. Percentages are of
 the raw SSD ceiling (2 213 MB/s write / 5 779 MB/s read); the last
 column names the change chiefly responsible for each row's movement.
 
-| Engine | write | % of SSD | read | % of SSD | vs. baseline | principal contributor |
-|---|---|---|---|---|---|---|
-| OFS (DOS\0) | 34 MB/s | 1.5% | 418 MB/s | 7.2% | ×1.4 w, ×2.2 r | read-side run coalescing; writes remain bound by per-block header checksums (format property) |
-| FFS (DOS\3) | 1 748 MB/s | 79% | 1 619 MB/s | 28% | ×15 w, ×6.5 r | run coalescing ([fix #4](#4-the-syscall-storm)) + O(1) free count ([fix #3](#3-the-bulk-import-slowdown)) + whole-table struct pack/unpack of block-pointer tables |
-| FFS (4 K blocks) | 2 868 MB/s | >100%* | 2 260 MB/s | 39% | ×3.2 w, ×2.9 r | same changes; at 96% of the host ceiling the engine is no longer the bottleneck |
-| FFS-DC (DOS\5) | 639 MB/s | 29% | 973 MB/s | 17% | ×5.5 w, ×4.0 r | shares the FFS data path; dircache cost applies to metadata ops, not bulk data |
-| FFS-LNFS (DOS\7) | 566 MB/s | 26% | 947 MB/s | 16% | ×4.8 w, ×3.8 r | shares the FFS data path; slight deficit from long-name field handling |
-| PFS3 | ~2 050 MB/s | 93% | 2 883 MB/s | 50% | ×6.2 w | zero-copy writes + allocator word-grab; per-dir caches: 227->2 954 creates/s in one dir |
-| SFS | 2 860 MB/s | >100%* | 2 233 MB/s | 39% | ×5.7 w | zero-copy writes (was FOUR payload copies), byte-fill bitmap, roving cursor; 156->2 779 creates/s in one dir |
+| Engine | write | % of SSD | read | % of SSD | create f/s | vs. first edition | principal contributors |
+|---|---|---|---|---|---|---|---|
+| OFS (DOS\0) | 38 MB/s | 2% | 530 MB/s | 9% | 2601 | ×1.6 w, ×2.8 r, ×9.9 c | writes format-bound (per-block embedded checksummed headers) |
+| FFS (DOS\3) | 1755 MB/s | 79% | 1540 MB/s | 27% | 7426 | ×15.0 w, ×6.2 r, ×26.1 c | run coalescing, O(1) free count, table slicing, ext-block batching |
+| FFS (4 K blocks) | 2855 MB/s | 129% | 2625 MB/s | 45% | 2596 | ×4.2 w, ×3.3 r, ×2.2 c | same changes; engine no longer the bottleneck |
+| FFS-DC (DOS\5) | 1727 MB/s | 78% | 1601 MB/s | 28% | 973 | ×14.8 w, ×6.5 r, ×7.6 c | shares the FFS data path; dircache cost hits metadata ops only |
+| FFS-LNFS (DOS\7) | 1284 MB/s | 58% | 1432 MB/s | 25% | 7464 | ×11.0 w, ×5.8 r, ×26.3 c | shares the FFS data path; long-name field handling costs ~25% on writes |
+| PFS3 | 1898 MB/s | 86% | 1741 MB/s | 30% | 9055 | ×5.8 w, ×0.6 r, ×3.5 c | zero-copy writes, allocator word-grab, per-dir caches |
+| SFS | 1481 MB/s | 67% | 2259 MB/s | 39% | 4017 | ×2.9 w, ×1.1 r, ×7.6 c | zero-copy writes (was four payload copies), byte-fill bitmap, roving cursor, per-dir caches |
 
 Metadata rates moved further than throughput: small-file creation on
 DOS\3 rose from 285 to 5 880 files/s (×20 — the O(1) counter and the
@@ -157,6 +157,9 @@ Observations, read against the yardstick:
   required by the on-disk format and is unaffected by I/O batching.
 - PFS3 and SFS writes are now the largest remaining gap; both would
   benefit from the same word-granular bitmap updates FFS received.
+
+Measured 2026-07-04 after the second optimization round; all rows
+re-benchmarked in one session on identical images.
 
 *Rates above 100% of the ceiling are legitimate: the baseline fsyncs
 per measurement while engines flush once per volume operation.
