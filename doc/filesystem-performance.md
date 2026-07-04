@@ -22,13 +22,13 @@ Before any emulated filesystem-specific measurements, let's get an SSD performan
 
 | Access pattern | write | read | note |
 |---|---|---|---|
-| sequential, 4 MB chunks | **2 213 MB/s** | **5 779 MB/s** | the host ceiling — 100% below |
-| sequential, 512 B calls | 564 MB/s | 1 908 MB/s | 75% write loss, 67% read loss (syscall overhead) |
-| 512 B with seek per block | 195 MB/s | 998 MB/s | 91% write loss, 83% read loss (the legacy filesystem access pattern) |
+| sequential, 4 MB chunks | **3 035 MB/s** | **6 637 MB/s** | the host ceiling — 100% below |
+| sequential, 512 B calls | 562 MB/s | 2 264 MB/s | 81% write loss, 66% read loss (syscall overhead) |
+| 512 B with seek per block | 195 MB/s | 1 253 MB/s | 94% write loss, 81% read loss (the legacy filesystem access pattern) |
 
-That third row tells the real story: just by mimicking the Amiga's classic pattern of seeking and reading one 512-byte block at a time, we throw away 91% of our write speed and 83% of our read speed before the filesystem even begins to process data. This means that any engine relying on block-by-block I/O has a hard ceiling of 195 MB/s for writes and 998 MB/s for reads, no matter how highly optimized the rest of its code might be.
+That third row tells the real story: just by mimicking the Amiga's classic pattern of seeking and reading one 512-byte block at a time, we throw away 94% of our write speed and 81% of our read speed before the filesystem even begins to process data. This means that any engine relying on block-by-block I/O has a hard ceiling of 195 MB/s for writes and ~1 250 MB/s for reads, no matter how highly optimized the rest of its code might be.
 
-Keep those two numbers in mind, because they explain almost everything else we discovered. For example, why were the early read speeds (around 250 MB/s) so far below their 998 MB/s ceiling, while the write speeds were much closer to theirs? Because reading block-by-block forced Python to create a brand new memory buffer object for every single 512-byte piece of data, adding massive overhead that the write path completely avoided.
+Keep those two numbers in mind, because they explain almost everything else we discovered. For example, why were the early read speeds (around 250 MB/s) so far below their per-block read ceiling, while the write speeds were much closer to theirs? Because reading block-by-block forced Python to create a brand new memory buffer object for every single 512-byte piece of data, adding massive overhead that the write path completely avoided.
 
 ## What the engines are actually used for
 
@@ -130,13 +130,13 @@ column names the change chiefly responsible for each row's movement.
 
 | Engine | write | % of SSD | read | % of SSD | create f/s | vs. first edition | principal contributors |
 |---|---|---|---|---|---|---|---|
-| OFS (DOS\0) | 38 MB/s | 2% | 530 MB/s | 9% | 2601 | ×1.6 w, ×2.8 r, ×9.9 c | writes format-bound (per-block embedded checksummed headers) |
-| FFS (DOS\3) | 1755 MB/s | 79% | 1540 MB/s | 27% | 7426 | ×15.0 w, ×6.2 r, ×26.1 c | run coalescing, O(1) free count, table slicing, ext-block batching |
-| FFS (4 K blocks) | 2855 MB/s | 129% | 2625 MB/s | 45% | 2596 | ×4.2 w, ×3.3 r, ×2.2 c | same changes; engine no longer the bottleneck |
-| FFS-DC (DOS\5) | 1727 MB/s | 78% | 1601 MB/s | 28% | 973 | ×14.8 w, ×6.5 r, ×7.6 c | shares the FFS data path; dircache cost hits metadata ops only |
-| FFS-LNFS (DOS\7) | 1284 MB/s | 58% | 1432 MB/s | 25% | 7464 | ×11.0 w, ×5.8 r, ×26.3 c | shares the FFS data path; long-name field handling costs ~25% on writes |
-| PFS3 | 1898 MB/s | 86% | 1741 MB/s | 30% | 9055 | ×5.8 w, ×0.6 r, ×3.5 c | zero-copy writes, allocator word-grab, per-dir caches |
-| SFS | 1481 MB/s | 67% | 2259 MB/s | 39% | 4017 | ×2.9 w, ×1.1 r, ×7.6 c | zero-copy writes (was four payload copies), byte-fill bitmap, roving cursor, per-dir caches |
+| OFS (DOS\0) | 38 MB/s | 1% | 530 MB/s | 8% | 2601 | ×1.6 w, ×2.8 r, ×9.9 c | writes format-bound (per-block embedded checksummed headers) |
+| FFS (DOS\3) | 1755 MB/s | 58% | 1540 MB/s | 23% | 7426 | ×15.0 w, ×6.2 r, ×26.1 c | run coalescing, O(1) free count, table slicing, ext-block batching |
+| FFS (4 K blocks) | 2855 MB/s | 94% | 2625 MB/s | 40% | 2596 | ×4.2 w, ×3.3 r, ×2.2 c | same changes; engine no longer the bottleneck |
+| FFS-DC (DOS\5) | 1727 MB/s | 57% | 1601 MB/s | 24% | 973 | ×14.8 w, ×6.5 r, ×7.6 c | shares the FFS data path; dircache cost hits metadata ops only |
+| FFS-LNFS (DOS\7) | 1284 MB/s | 42% | 1432 MB/s | 22% | 7464 | ×11.0 w, ×5.8 r, ×26.3 c | shares the FFS data path; long-name field handling costs ~25% on writes |
+| PFS3 | 1898 MB/s | 63% | 1741 MB/s | 26% | 9055 | ×5.8 w, ×0.6 r, ×3.5 c | zero-copy writes, allocator word-grab, per-dir caches |
+| SFS | 1481 MB/s | 49% | 2259 MB/s | 34% | 4017 | ×2.9 w, ×1.1 r, ×7.6 c | zero-copy writes (was four payload copies), byte-fill bitmap, roving cursor, per-dir caches |
 
 Metadata rates moved further than throughput: small-file creation on
 DOS\3 rose from 285 to 5 880 files/s (×20 — the O(1) counter and the
@@ -161,8 +161,10 @@ Observations, read against the yardstick:
 Measured 2026-07-04 after the second optimization round; all rows
 re-benchmarked in one session on identical images.
 
-*Rates above 100% of the ceiling are legitimate: the baseline fsyncs
-per measurement while engines flush once per volume operation.
+The SSD baseline and all engine rows above were measured in the same
+session — percentages are only meaningful against a same-day yardstick
+(an earlier edition compared against a stale baseline and produced an
+impossible 129%).
 
 **Second optimization round (insights).** After the first edition of
 this table, three further patterns were found and fixed, each worth
