@@ -10,14 +10,17 @@ class TarHandler(ArchiveHandler):
         
     def test_archive(self):
         from ..tarreader import open_tar
-        print("verifying archive integrity: %s..." % self.path)
+        import sys
+        sys.stdout.write("verifying archive integrity: %s... " % self.path)
+        sys.stdout.flush()
         try:
             with open_tar(self.path) as tar:
                 for _ in tar:
                     pass
+            print("OK")
             return True
         except Exception as e:
-            print("error: archive verification failed: %s" % e, file=sys.stderr)
+            print("ERROR: %s" % e)
             return False
             
     def stream_to_volume(self, vol, base_amiga_path, truncate_func, max_len, protect, comment):
