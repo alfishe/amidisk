@@ -277,14 +277,26 @@ class Bitmap:
         total = vol.total
         wrapped = False
         while len(found) < count:
-            # skip fully-allocated 32-block words at word-compare speed
             idx = blk - vol.reserved
             if idx % 32 == 0 and blk + 32 <= total:
                 page, off = self._locate(blk)
-                if self.pages[page].long(1 + off // 32) == 0:
+                buf = self.pages[page]
+                li = 1 + off // 32
+                word = buf.long(li)
+                if word == 0:
+                    # fully allocated: skip the word
                     blk += 32
                     if wrapped and start <= blk:
                         break
+                    continue
+                if word == 0xFFFFFFFF and len(found) + 32 <= count:
+                    # fully free and we need all of it: grab the word
+                    buf.put_long(li, 0)
+                    self.dirty.add(page)
+                    if self._free_count is not None:
+                        self._free_count -= 32
+                    found.extend(range(blk, blk + 32))
+                    blk += 32
                     continue
             if blk >= total:
                 blk = vol.reserved
@@ -537,11 +549,14 @@ class FFSVolume:
     def read_file_bytes(self, path):
         return b"".join(self.read_file(path))
 
-    def _read_data(self, entry):
-        remaining = entry.size
+    def _data_block_table(self, entry):
+        """All data-block pointers of a file, in order."""
+        ptrs = []
         blk = entry.blk
         guard = 0
-        while remaining > 0:
+        data_bytes = self.bs if self.ffs else self.bs - 24
+        need = (entry.size + data_bytes - 1) // data_bytes
+        while blk and len(ptrs) < need:
             guard += 1
             if guard > MAX_CHAIN:
                 raise FSError("cyclic extension chain in file %s" % entry.name_str())
@@ -549,28 +564,49 @@ class FFSVolume:
             count = buf.long(2)
             if count == 0:
                 raise FSError("truncated file %s" % entry.name_str())
-            for k in range(count):
+            for k in range(min(count, self.tsz)):
                 ptr = buf.long(6 + self.tsz - 1 - k)
                 if ptr == 0:
                     raise FSError("hole in data block table of %s" % entry.name_str())
-                data = self.read_buf(ptr)
-                if self.ffs:
-                    chunk = bytes(data.data[: min(self.bs, remaining)])
-                else:
-                    dsize = data.long(3)
-                    if data.long(0) != T_DATA:
-                        raise FSError("bad OFS data block %d" % ptr)
-                    chunk = bytes(data.data[24 : 24 + min(dsize, remaining)])
-                yield chunk
-                remaining -= len(chunk)
-                if remaining <= 0:
-                    break
-            if remaining > 0:
-                blk = buf.long(-2)
-                if blk == 0:
-                    raise FSError("missing extension block in %s" % entry.name_str())
+                ptrs.append(ptr)
+            blk = buf.long(-2)
+        if len(ptrs) < need:
+            raise FSError("missing extension block in %s" % entry.name_str())
+        return ptrs[:need]
 
-    # -- helpers for writing -------------------------------------------------
+    def _read_data(self, entry):
+        """Yield the file's data, coalescing consecutive blocks into
+        large reads (one syscall per run instead of one per block)."""
+        remaining = entry.size
+        if remaining <= 0:
+            return
+        ptrs = self._data_block_table(entry)
+        data_bytes = self.bs if self.ffs else self.bs - 24
+        MAX_RUN = max(1, (4 << 20) // self.bs)
+        i = 0
+        n = len(ptrs)
+        while i < n and remaining > 0:
+            j = i + 1
+            while j < n and j - i < MAX_RUN and ptrs[j] == ptrs[j - 1] + 1:
+                j += 1
+            raw = self.dev.read(ptrs[i] * self.spb, (j - i) * self.spb)
+            if self.ffs:
+                take = min(len(raw), remaining)
+                yield raw[:take] if take != len(raw) else raw
+                remaining -= take
+            else:
+                for k in range(j - i):
+                    o = k * self.bs
+                    btype, _hk, _seq, dsize = struct.unpack_from(">4I", raw, o)
+                    if btype != T_DATA:
+                        raise FSError("bad OFS data block %d" % ptrs[i + k])
+                    take = min(dsize, remaining, data_bytes)
+                    yield raw[o + 24 : o + 24 + take]
+                    remaining -= take
+                    if remaining <= 0:
+                        break
+            i = j
+
     def _now_stamp(self, buf, long_idx, when=None):
         d, m, t = datetime_to_amiga(when or datetime.now())
         buf.put_long(long_idx, d)
@@ -864,50 +900,66 @@ class FFSVolume:
         ext_blks = blocks[1 + ndata :]
 
         try:
-            # data blocks
-            if isinstance(data, bytes):
-                for i, blk in enumerate(data_blks):
-                    chunk = data[i * data_bytes : (i + 1) * data_bytes]
-                    if self.ffs:
-                        payload = bytes(chunk).ljust(self.bs, b"\x00")
-                        self.dev.write(blk * self.spb, payload)
-                    else:
-                        buf = BlockBuf(None, self.bs)
-                        buf.put_long(0, T_DATA)
-                        buf.put_long(1, hdr_blk)
-                        buf.put_long(2, i + 1)                     # sequence number
-                        buf.put_long(3, len(chunk))
-                        buf.put_long(4, data_blks[i + 1] if i + 1 < ndata else 0)
-                        buf.data[24 : 24 + len(chunk)] = chunk
-                        buf.fix_checksum()
-                        self.write_buf(blk, buf)
+            # data blocks: coalesce consecutive allocations into large
+            # writes (one syscall per run instead of one per 512 bytes)
+            if isinstance(data, (bytes, bytearray, memoryview)):
+                src = memoryview(data)
+                pos = [0]
+
+                def pull(n):
+                    chunk = bytes(src[pos[0] : pos[0] + n])
+                    pos[0] += n
+                    if len(chunk) < n:
+                        raise FSError("stream ended prematurely")
+                    return chunk
             else:
-                iterator = iter(data)
-                buf_stream = bytearray()
-                for i, blk in enumerate(data_blks):
-                    chunk_len = min(data_bytes, size - i * data_bytes)
-                    while len(buf_stream) < chunk_len:
+                it = iter(data)
+                sbuf = bytearray()
+
+                def pull(n):
+                    while len(sbuf) < n:
                         try:
-                            buf_stream += next(iterator)
+                            sbuf.extend(next(it))
                         except StopIteration:
                             raise FSError("stream ended prematurely")
-                    chunk = bytes(buf_stream[:chunk_len])
-                    buf_stream = buf_stream[chunk_len:]
-                    
-                    if self.ffs:
-                        payload = chunk.ljust(self.bs, b"\x00")
-                        self.dev.write(blk * self.spb, payload)
-                    else:
-                        buf = BlockBuf(None, self.bs)
-                        buf.put_long(0, T_DATA)
-                        buf.put_long(1, hdr_blk)
-                        buf.put_long(2, i + 1)
-                        buf.put_long(3, len(chunk))
-                        buf.put_long(4, data_blks[i + 1] if i + 1 < ndata else 0)
-                        buf.data[24 : 24 + len(chunk)] = chunk
-                        buf.fix_checksum()
-                        self.write_buf(blk, buf)
-                        
+                    chunk = bytes(sbuf[:n])
+                    del sbuf[:n]
+                    return chunk
+
+            MAX_RUN = max(1, (4 << 20) // self.bs)  # cap run buffers at 4 MB
+            i = 0
+            while i < ndata:
+                # extend the run while block numbers stay consecutive
+                j = i + 1
+                while (j < ndata and j - i < MAX_RUN
+                       and data_blks[j] == data_blks[j - 1] + 1):
+                    j += 1
+                want = min((j - i) * data_bytes, size - i * data_bytes)
+                payload = pull(want)
+                if self.ffs:
+                    pad = (j - i) * self.bs - len(payload)
+                    if pad:
+                        payload += b"\x00" * pad
+                    self.dev.write(data_blks[i] * self.spb, payload)
+                else:
+                    run = bytearray((j - i) * self.bs)
+                    for k in range(i, j):
+                        chunk = payload[(k - i) * data_bytes :
+                                        (k - i + 1) * data_bytes]
+                        o = (k - i) * self.bs
+                        struct.pack_into(
+                            ">5I", run, o, T_DATA, hdr_blk, k + 1, len(chunk),
+                            data_blks[k + 1] if k + 1 < ndata else 0,
+                        )
+                        run[o + 24 : o + 24 + len(chunk)] = chunk
+                        s = 0
+                        for (v,) in struct.iter_unpack(
+                                ">I", bytes(run[o : o + self.bs])):
+                            s = (s + v) & 0xFFFFFFFF
+                        struct.pack_into(">I", run, o + 20, (-s) & 0xFFFFFFFF)
+                    self.dev.write(data_blks[i] * self.spb, bytes(run))
+                i = j
+
             # extension blocks (written last-to-first to know the next pointer)
             next_ext_ptr = 0
             for x in range(next_blocks - 1, -1, -1):

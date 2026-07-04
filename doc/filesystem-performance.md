@@ -11,11 +11,11 @@ in one directory (create / list / delete), shallow `check`.
 
 | Engine | format | mount | write MB/s | read MB/s | create f/s | list 200 | check | delete f/s |
 |---|---|---|---|---|---|---|---|---|
-| OFS (DOS\0) | 0.11 s | 6 ms | 25 | 191 | 263 | 1 ms | 0.30 s | 13 245 |
-| FFS (DOS\3) | 0.11 s | 6 ms | 117 | 249 | 285 | 1 ms | 0.29 s | 13 675 |
-| FFS (DOS\3, 4 K blocks) | 0.01 s | 1 ms | 673 | 787 | 1 170 | 2 ms | 0.05 s | 4 455 |
-| FFS-DC (DOS\5) | 0.12 s | 5 ms | 117 | 245 | 129 | 1 ms | 0.29 s | 231 |
-| FFS-LNFS (DOS\7) | 0.11 s | 6 ms | 117 | 248 | 284 | 2 ms | 0.29 s | 12 871 |
+| OFS (DOS\0) | 0.11 s | 6 ms | 34 | 418 | 2 447 | 1 ms | 0.30 s | 13 245 |
+| FFS (DOS\3) | 0.11 s | 6 ms | 647 | 987 | 5 880 | 1 ms | 0.29 s | 13 675 |
+| FFS (DOS\3, 4 K blocks) | 0.01 s | 1 ms | 1 936 | 2 137 | 2 613 | 2 ms | 0.05 s | 4 455 |
+| FFS-DC (DOS\5) | 0.12 s | 5 ms | 639 | 973 | 129 | 1 ms | 0.29 s | 231 |
+| FFS-LNFS (DOS\7) | 0.11 s | 6 ms | 566 | 947 | 284 | 2 ms | 0.29 s | 12 871 |
 | PFS3 | 0.01 s | <1 ms | 328 | 2 883 | 2 605 | <1 ms | 1 ms | 2 191 |
 | SFS | 0.02 s | <1 ms | 506 | 1 970 | 526 | 1 ms | 8 ms | 2 284 |
 
@@ -25,9 +25,9 @@ mount stays in milliseconds for all engines.
 ### Why the numbers look the way they do
 
 - **OFS writes are slow by design**: every 512-byte data block carries a
-  24-byte header and checksum built per block in Python (~25 MB/s).
-  FFS writes raw blocks (~117 MB/s); with 4 K blocks the per-block count
-  drops 8× (~673 MB/s).
+  24-byte header and checksum built per block in Python (~34 MB/s even
+  with batched I/O). FFS writes raw coalesced runs (~650 MB/s; ~1.9 GB/s
+  with 4 K blocks).
 - **PFS3/SFS are fastest** because both use extent/run allocation: a
   contiguous 200 MB file is a handful of (start, length) runs, so reads
   become a few large sequential I/Os (GB/s from page cache) instead of
@@ -66,6 +66,16 @@ this document:
 | disk-full error, FFS (3 GB) | 11.2 s (scanned whole bitmap) | 24 ms (fail fast from free counter) |
 | disk-full error, PFS3 (3 GB) | 12.6 s | <1 ms |
 | disk-full error, SFS (3 GB) | 1.1 s | <1 ms |
+
+FFS I/O is **run-coalesced** (added after the first edition of this
+table): consecutive data blocks are transferred as single reads/writes
+of up to 4 MB, the allocator grabs fully-free 32-block words in one
+operation, and the free-block count is cached and maintained
+incrementally instead of recounted per allocation. Combined effect on
+DOS\3: writes 117 -> 647 MB/s, reads 249 -> 987 MB/s, small-file
+creation 285 -> 5 880 files/s (the recount alone had made bulk imports
+quadratic). OFS write throughput remains header-bound (per-block
+checksums in Python).
 
 Allocators also now skip fully-allocated 32-block words at word-compare
 speed (FFS, PFS3), so nearly-full volumes don't degrade to per-bit
