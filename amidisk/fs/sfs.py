@@ -583,6 +583,10 @@ class SFSVolume:
 
         cur_start = -1
         cur_count = 0
+        # 4K-align the starts of large allocations when there is slack
+        align = 4096 // self.bs if self.bs < 4096 else 1
+        if count < 4096 or self.freeblocks - count < 4096:
+            align = 1
 
         # roving start: resume where the last allocation ended instead of
         # rescanning the used prefix of the bitmap on every call
@@ -616,6 +620,15 @@ class SFSVolume:
                         else:
                             if cur_count:
                                 chunks.append((cur_start, cur_count))
+                            if align > 1 and blk % align:
+                                # start large runs 4K-aligned: unaligned
+                                # F_NOCACHE I/O loses the direct path
+                                skip = align - blk % align
+                                blk += skip
+                                w = (w << skip) & 0xFFFFFFFF  # unused bits stay free
+                                if blk + 32 > self.total or w != 0xFFFFFFFF:
+                                    cur_start, cur_count = blk, 0
+                                    continue
                             cur_start, cur_count = blk, 32
                         needed -= 32
                         if needed == 0:
@@ -1081,7 +1094,17 @@ class SFSVolume:
                 raise FSError("cyclic SFS extent chain")
             nxt, blocks = self._find_extent(block)
             want = min(blocks * self.bs, e.size - pos)
-            segs.append((block * self.spb, pos, want))
+            lba = block * self.spb
+            # the u16 extent size field splits large files into 32 MB
+            # extent records, but the blocks themselves are usually laid
+            # down consecutively: merge physically-adjacent extents so a
+            # contiguous file becomes ONE device read
+            if segs and segs[-1][0] + (segs[-1][2] + self.dev.block_bytes - 1) \
+                    // self.dev.block_bytes == lba:
+                plba, ppos, pwant = segs[-1]
+                segs[-1] = (plba, ppos, pwant + want)
+            else:
+                segs.append((lba, pos, want))
             pos += want
             block = nxt
         if len(segs) == 1 and e.size % self.dev.block_bytes == 0:
