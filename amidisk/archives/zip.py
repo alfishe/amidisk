@@ -54,20 +54,15 @@ class ZipHandler(ArchiveHandler):
                         if parent_dir:
                             vol.makedirs(parent_dir)
                             
+                        from .base import read_chunks
                         with zf.open(info) as fh:
                             mtime = datetime(*info.date_time)
                             vol.write_file(
-                                amiga_dir, fh, size=info.file_size, 
+                                amiga_dir, read_chunks(fh), size=info.file_size, 
                                 protect=protect, comment=comment, mtime=mtime
                             )
                             n += 1
                             total_bytes += info.file_size
-                            
-                            if (total_bytes - last_flush_bytes) > 50_000_000:
-                                if hasattr(vol, "bitmap"):
-                                    vol.bitmap.flush()
-                                vol.dev.flush()
-                                last_flush_bytes = total_bytes
                                 
                     # Progress approx
                     print_progress(min(total_bytes, total_archive_size), total_archive_size, parts[-1])

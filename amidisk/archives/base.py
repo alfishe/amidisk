@@ -1,3 +1,6 @@
+import os
+import shutil
+
 class ArchiveHandler:
     """Base class for streaming archive contents into an Amiga volume."""
     
@@ -18,3 +21,26 @@ class ArchiveHandler:
         """Iterates over archive members and streams them into the volume.
         Returns (num_files_streamed, total_bytes_streamed)."""
         raise NotImplementedError()
+
+
+def find_executable(names):
+    """Finds an executable in PATH or common search paths."""
+    for name in names:
+        path = shutil.which(name)
+        if path:
+            return path
+    for name in names:
+        for loc in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]:
+            path = os.path.join(loc, name)
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+    return None
+
+
+def read_chunks(fh, chunk_size=65536):
+    """Reads binary chunks from a file-like object to prevent line-by-line iteration overhead."""
+    while True:
+        chunk = fh.read(chunk_size)
+        if not chunk:
+            break
+        yield chunk
