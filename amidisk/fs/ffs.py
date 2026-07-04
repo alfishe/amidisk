@@ -17,7 +17,7 @@ All eight classic dostypes are fully supported, including write:
 import struct
 from datetime import datetime
 
-from ..blkdev import fill_parallel
+from ..blkdev import fill_parallel, alloc_read_buffer
 
 from .util import (
     amiga_to_datetime,
@@ -238,7 +238,21 @@ class Bitmap:
                 "bitmap too small: %d pages, need %d" % (len(ptrs), needed)
             )
         self.page_blks = ptrs[:needed]
-        self.pages = [self.vol.read_buf(p) for p in self.page_blks]
+        # bitmap pages are allocated consecutively: load them in batched
+        # device reads instead of one small read per page
+        self.pages = []
+        i = 0
+        n = len(self.page_blks)
+        while i < n:
+            j = i + 1
+            while j < n and self.page_blks[j] == self.page_blks[j - 1] + 1:
+                j += 1
+            raw = vol.dev.read(self.page_blks[i] * vol.spb,
+                               (j - i) * vol.spb)
+            for k in range(j - i):
+                self.pages.append(
+                    BlockBuf(raw[k * vol.bs : (k + 1) * vol.bs], vol.bs))
+            i = j
         for buf in self.pages:
             if not buf.checksum_ok():
                 raise FSError("bitmap block checksum error")
@@ -680,12 +694,12 @@ class FFSVolume:
             raise FSError("not a file: %s" % e.name_str())
         if not self.ffs or e.size == 0 or not hasattr(self.dev, "read_into"):
             return b"".join(self._read_data(e))
-        # FFS data blocks are pure payload: read runs straight into one
-        # preallocated buffer -- no per-chunk objects, no join copy
-        runs = list(self._data_runs(e))
+        # walk the table first, then fill with parallel 16 MB positional
+        # reads -- measured faster than overlapping the walk with worker
+        # reads (concurrent small fh reads disturb the direct-I/O stream)
         segs = []
         pos = 0
-        for start, count in runs:
+        for start, count in self._data_runs(e):
             want = min(count * self.bs, e.size - pos)
             segs.append((start * self.spb, pos, want))
             pos += want
@@ -693,11 +707,7 @@ class FFSVolume:
                 break
         if pos < e.size:
             raise FSError("missing extension block in %s" % e.name_str())
-        if len(segs) == 1 and e.size % self.bs == 0:
-            # single aligned run: freshly allocated pages from one read
-            # beat readinto-a-reused-buffer by ~2x on this hardware
-            return self.dev.read(segs[0][0], e.size // self.dev.block_bytes)
-        out = bytearray(e.size)
+        out = alloc_read_buffer(e.size)
         fill_parallel(self.dev, memoryview(out), segs)
         return out  # bytearray: avoids a full-payload copy
 
@@ -715,7 +725,7 @@ class FFSVolume:
         run_s = run_n = 0
         first = True
         while blk and got_ptrs < need:
-            batch = 1 if first else min(1024, max(1, self.total - blk))
+            batch = 1 if first else min(8192, max(1, self.total - blk))
             first = False
             raw = self.dev.read(blk * self.spb, batch * self.spb)
             off = 0
@@ -777,7 +787,7 @@ class FFSVolume:
             # usually by AmigaOS): read speculative batches of 256 and
             # walk the chain inside the buffer while pointers stay
             # consecutive -- 5 690 single-block reads become ~23 batches
-            batch = 1 if first else min(1024, max(1, self.total - blk))
+            batch = 1 if first else min(8192, max(1, self.total - blk))
             first = False
             raw = self.dev.read(blk * self.spb, batch * self.spb)
             off = 0

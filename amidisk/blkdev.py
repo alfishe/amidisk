@@ -77,10 +77,15 @@ class ImageFileBlkDev(BlockDevice):
         self.fh.seek(lba * self.block_bytes)
         return self.fh.readinto(out)
 
-    def pread_into(self, lba, out):
-        """Positional read into a buffer: thread-safe (no shared seek),
-        used by parallel read assembly. Coherent with buffered writes
-        because callers flush first."""
+    def pread(self, lba, nbytes):
+        """Positional read returning fresh bytes: thread-safe (own fd,
+        no shared seek), any byte length. Callers must flush writes
+        first if coherence matters."""
+        import os as _os
+        self._ensure_raw_rfd()
+        return _os.pread(self._raw_rfd, nbytes, lba * self.block_bytes)
+
+    def _ensure_raw_rfd(self):
         import os as _os
         if getattr(self, "_raw_rfd", None) is None:
             self._raw_rfd = _os.open(self.path, _os.O_RDONLY)
@@ -90,6 +95,13 @@ class ImageFileBlkDev(BlockDevice):
                     _fcntl.fcntl(self._raw_rfd, _fcntl.F_NOCACHE, 1)
             except ImportError:
                 pass
+
+    def pread_into(self, lba, out):
+        """Positional read into a buffer: thread-safe (no shared seek),
+        used by parallel read assembly. Coherent with buffered writes
+        because callers flush first."""
+        import os as _os
+        self._ensure_raw_rfd()
         return _os.preadv(self._raw_rfd, [out], lba * self.block_bytes)
 
     def write(self, lba, data):
@@ -394,3 +406,14 @@ def fill_parallel(dev, mv, segs, seg_bytes=16 << 20, threads=4):
     with ThreadPoolExecutor(max_workers=threads) as ex:
         for _ in ex.map(job, work):
             pass
+
+
+def alloc_read_buffer(size):
+    """Buffer for assembling large file reads: anonymous mmap for big
+    sizes (kernel lazy-zero pages skip the upfront memset a bytearray
+    pays), bytearray for small ones. Both support the buffer protocol;
+    callers may hand either back to the API user."""
+    if size >= (8 << 20):
+        import mmap
+        return mmap.mmap(-1, size)
+    return bytearray(size)

@@ -22,7 +22,7 @@ import time
 from datetime import timedelta
 
 from .ffs import FSError
-from ..blkdev import fill_parallel
+from ..blkdev import fill_parallel, alloc_read_buffer
 from .util import EPOCH, protect_to_str
 
 ROOT_ID = 0x53465300         # 'SFS\0'
@@ -642,6 +642,9 @@ class SFSVolume:
                         break
                         
                     is_free = (w & (1 << (31 - bit_in_word))) != 0
+                    if (is_free and cur_count == 0 and align > 1
+                            and blk % align):
+                        continue  # free but unaligned run start: skip
                     if is_free:
                         if cur_count == 0:
                             cur_start = blk
@@ -1107,10 +1110,7 @@ class SFSVolume:
                 segs.append((lba, pos, want))
             pos += want
             block = nxt
-        if len(segs) == 1 and e.size % self.dev.block_bytes == 0:
-            # single aligned extent: fresh-page read, no fill/copy
-            return self.dev.read(segs[0][0], e.size // self.dev.block_bytes)
-        out = bytearray(e.size)
+        out = alloc_read_buffer(e.size)
         fill_parallel(self.dev, memoryview(out), segs)
         return out  # bytearray: avoids a full-payload copy
 

@@ -18,7 +18,7 @@ Addressing model (from the source):
 import struct
 
 from .ffs import FSError  # shared exception type
-from ..blkdev import fill_parallel
+from ..blkdev import fill_parallel, alloc_read_buffer
 from .util import amiga_to_datetime, protect_to_str
 
 # rootblock.disktype values
@@ -441,10 +441,7 @@ class PFS3Volume:
         if pos < e.size:
             raise FSError("truncated PFS3 file %s (%d bytes missing)"
                           % (e.name_str(), e.size - pos))
-        if len(segs) == 1 and e.size % self.dev.block_bytes == 0:
-            # single aligned extent: fresh-page read, no fill/copy
-            return self.dev.read(segs[0][0], e.size // self.dev.block_bytes)
-        out = bytearray(e.size)
+        out = alloc_read_buffer(e.size)
         fill_parallel(self.dev, memoryview(out), segs)
         return out  # bytearray: avoids a full-payload copy
 
@@ -596,7 +593,14 @@ class PFS3Volume:
         start = self._bitmapstart()
         runs = []
         got = 0
+        # start large allocations 4K-aligned: unaligned F_NOCACHE I/O
+        # loses the direct path (skipped blocks simply remain free)
+        align = 4096 // self.bytes_per_block if self.bytes_per_block < 4096 else 1
+        if count < 4096 or self.blocksfree - count < 4096:
+            align = 1
         blk = self._roving if start <= self._roving < total else start
+        if align > 1 and blk % align:
+            blk += align - blk % align
         wrapped = False
         run_s = run_n = 0
         while got < count:
@@ -636,6 +640,9 @@ class PFS3Volume:
                     blk += 32
                     continue
             if self._block_is_free(blk):
+                if run_n == 0 and align > 1 and blk % align:
+                    blk += 1  # free but unaligned run start: leave it free
+                    continue
                 if run_n and run_s + run_n == blk:
                     run_n += 1
                 else:
