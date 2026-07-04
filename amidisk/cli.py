@@ -22,8 +22,21 @@ from .blkdev import BlockDeviceError
 def print_progress(current_bytes, total_bytes, current_file=""):
     """Prints a dynamic, overwriting progress bar to stdout."""
     percent = (current_bytes / total_bytes) * 100 if total_bytes > 0 else 0
+    
+    import time
+    now = time.time()
+    last_t = getattr(print_progress, "_last_t", 0)
+    last_p = getattr(print_progress, "_last_p", -1)
+    
+    # Throttle: print only if 1% boundary crossed, or 0.1s elapsed, or if complete
+    if current_bytes < total_bytes and (now - last_t < 0.1) and int(percent) == int(last_p):
+        return
+        
+    print_progress._last_t = now
+    print_progress._last_p = percent
+
     bar_len = 30
-    filled = int((percent / 100) * bar_len)
+    filled = int((percent / 100) * bar_len) if percent <= 100 else bar_len
     bar = '#' * filled + '-' * (bar_len - filled)
     
     # \x1b[2K clears the entire current line, \r returns cursor to the beginning
@@ -58,6 +71,9 @@ def _combine_path(vol_name, path):
     """Combines a parsed volume name and an optional path back into a volume:path string."""
     path = path or ""
     if not path:
+        if "/" in vol_name and ":" not in vol_name:
+            v, p = vol_name.split("/", 1)
+            return v + ":" + p
         return vol_name + ":" if vol_name else ""
     if ":" not in path and vol_name:
         return vol_name + ":" + path
@@ -120,7 +136,11 @@ def cmd_info(args):
                         else:
                             print("  bootblock:  INVALID CHECKSUM (ID: %s, got: 0x%08X, exp: 0x%08X)" % (id_str, got, exp))
                 
-                rep = vol.check(deep=False)
+                sys.stdout.write("  Scanning...")
+                sys.stdout.flush()
+                rep = vol.check(deep=args.deep)
+                sys.stdout.write("\x1b[2K\r") # clear the scanning line
+                
                 print("  files:      %d" % rep["files"])
                 print("  dirs:       %d" % rep["dirs"])
                 status = "OK" if rep["ok"] else "ERRORS"
@@ -218,7 +238,7 @@ def cmd_info(args):
 def cmd_ls(args):
     img_path, vol_name = _parse_image_arg(args.image)
     with open_image(img_path) as img:
-        vol_ref, path = img.parse_path(_combine_path(vol_name, args.path))
+        vol_ref, path = img.parse_path(_combine_path(vol_name, ""))
         vol = vol_ref.mount()
         entry = vol.resolve(path)
         entries = (
@@ -239,11 +259,10 @@ def cmd_ls(args):
     return 0
 
 
-# ---------------------------------------------------------------- cat
 def cmd_cat(args):
     img_path, vol_name = _parse_image_arg(args.image)
     with open_image(img_path) as img:
-        vol_ref, path = img.parse_path(_combine_path(vol_name, args.path))
+        vol_ref, path = img.parse_path(_combine_path(vol_name, ""))
         vol = vol_ref.mount()
         out = sys.stdout.buffer
         for chunk in vol.read_file(path):
@@ -320,11 +339,32 @@ class ChecksumStream:
             raise
 
 def cmd_cp(args):
-    img1, vol1 = _parse_image_arg(args.src_image)
-    img2, vol2 = _parse_image_arg(args.dst_image)
+    img1, vol1 = _parse_image_arg(args.src)
+    img2, vol2 = _parse_image_arg(args.dst)
+    
+    # Check modes
+    # If no volume was parsed for the source (meaning it's a host path),
+    # and the destination is an image, route to cmd_put.
+    if not vol1 and vol2:
+        args.image = args.dst
+        args.dest = "" # Empty string instead of None to avoid legacy SCP logic
+        return cmd_put(args)
+        
+    # If the source is an image and the destination is a host path, route to cmd_extract.
+    if vol1 and not vol2:
+        args.image = args.src
+        args.path = "" # Empty string for _combine_path
+        args.dest = args.dst
+        return cmd_extract(args)
+        
+    if not vol1 and not vol2:
+        print("error: standard host-to-host transfer. Please use your operating system's 'cp' command.", file=sys.stderr)
+        return 1
+        
+    # Otherwise, image-to-image streaming
     with open_image(img1) as src_img, open_image(img2, writable=True) as dst_img:
-        src_vol_ref, src_path = src_img.parse_path(_combine_path(vol1, args.src_path))
-        dst_vol_ref, dst_path = dst_img.parse_path(_combine_path(vol2, args.dst_path))
+        src_vol_ref, src_path = src_img.parse_path(_combine_path(vol1, ""))
+        dst_vol_ref, dst_path = dst_img.parse_path(_combine_path(vol2, ""))
         
         src_vol = src_vol_ref.mount()
         dst_vol = dst_vol_ref.mount()
@@ -342,12 +382,12 @@ def cmd_cp(args):
                 pass
             
             stream = src_vol.read_file(entry)
-            chk_stream = ChecksumStream(stream) if args.checksum else stream
+            chk_stream = ChecksumStream(stream) if getattr(args, "checksum", False) else stream
             
             dst_vol.write_file(dst_path, chk_stream, size=entry.size, protect=entry.protect, mtime=entry.mtime())
             total_bytes += entry.size
             file_count += 1
-            if args.checksum:
+            if getattr(args, "checksum", False):
                 print(f"copied {dst_path} (md5: {chk_stream.md5.hexdigest()})")
             else:
                 print(f"copied {dst_path}")
@@ -374,19 +414,14 @@ def cmd_cp(args):
             elif e.is_file():
                 if amiga_dir:
                     dst_vol.makedirs(amiga_dir)
-                dst_file = amiga_dir + "/" + e.name_str() if amiga_dir else e.name_str()
-                
+                dst_path_full = amiga_dir + "/" + e.name_str() if amiga_dir else e.name_str()
                 stream = src_vol.read_file(e)
-                chk_stream = ChecksumStream(stream) if args.checksum else stream
-                
-                dst_vol.write_file(dst_file, chk_stream, size=e.size, protect=e.protect, mtime=e.mtime())
+                dst_vol.write_file(dst_path_full, stream, size=e.size, protect=e.protect, mtime=e.mtime())
                 total_bytes += e.size
                 file_count += 1
-                if args.checksum:
-                    print(f"copied {dst_file} (md5: {chk_stream.md5.hexdigest()})")
+                print_progress(total_bytes, total_bytes, e.name_str())
                 
-        elapsed = time.time() - start_time
-        print(f"copied {file_count} files, {total_bytes} bytes in {elapsed:.4f} seconds")
+        print("\nstreamed %d files (%d bytes)" % (file_count, total_bytes))
     return 0
 
 
@@ -529,23 +564,23 @@ def cmd_put(args):
 def cmd_mkdir(args):
     img_path, vol_name = _parse_image_arg(args.image)
     with open_image(img_path, writable=True) as img:
-        vol_ref, path = img.parse_path(_combine_path(vol_name, args.path))
+        vol_ref, path = img.parse_path(_combine_path(vol_name, ""))
         vol = vol_ref.mount()
         if args.parents:
             vol.makedirs(path)
         else:
             vol.mkdir(path)
-        print("created %s" % args.path)
+        print("created %s" % args.image)
     return 0
 
 
 def cmd_rm(args):
     img_path, vol_name = _parse_image_arg(args.image)
     with open_image(img_path, writable=True) as img:
-        vol_ref, path = img.parse_path(_combine_path(vol_name, args.path))
+        vol_ref, path = img.parse_path(_combine_path(vol_name, ""))
         vol = vol_ref.mount()
         vol.delete(path, recursive=args.recursive)
-        print("deleted %s" % args.path)
+        print("deleted %s" % args.image)
     return 0
 
 
@@ -1286,6 +1321,7 @@ def main(argv=None):
     p = sub.add_parser("info", help="show image, RDB and volume overview")
     p.add_argument("image")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--deep", action="store_true", help="scan all directories to count files/dirs")
     p.set_defaults(func=cmd_info)
 
     p = sub.add_parser("bench", help="benchmark file read operations")
@@ -1296,64 +1332,58 @@ def main(argv=None):
     p.add_argument("--filter", help="substring filter for file names")
     p.set_defaults(func=cmd_bench)
 
-    p = sub.add_parser("ls", help="list a directory (VOL:Path)")
-    p.add_argument("image")
-    p.add_argument("path", nargs="?", default="")
+    p = sub.add_parser("ls", help="list directory contents")
+    p.add_argument("image", help="image.hdf:Volume[/path]")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_ls)
 
-    p = sub.add_parser("cat", help="print a file to stdout")
-    p.add_argument("image")
-    p.add_argument("path")
+    p = sub.add_parser("cat", help="output file contents to stdout")
+    p.add_argument("image", help="image.hdf:Volume/path")
     p.set_defaults(func=cmd_cat)
 
-    p = sub.add_parser("extract", help="copy files out of the image")
-    p.add_argument("image")
-    p.add_argument("path")
-    p.add_argument("dest")
-    p.add_argument("-r", "--recursive", action="store_true")
+    p = sub.add_parser("extract", help="extract files to host filesystem")
+    p.add_argument("image", help="image.hdf:Volume/path")
+    p.add_argument("dest", nargs="?", help="host destination path (optional)")
+    p.add_argument("-r", "--recursive", action="store_true", help="extract directories recursively")
     p.set_defaults(func=cmd_extract)
 
     p = sub.add_parser("put", help="copy a host file/dir into the image")
     p.add_argument("image")
     p.add_argument("src")
     p.add_argument("dest", nargs="?", help="optional if SCP-style syntax used")
-    p.add_argument("-r", "--recursive", action="store_true")
-    p.add_argument("--comment")
     p.add_argument("--protect", help="e.g. 'hsparwed' subset like '----rwed'")
-    p.add_argument("--bulk", action="store_true",
-                   help="batch metadata commits for mass imports (faster; "
-                        "a crash mid-run may need `repair --write`)")
-    p.set_defaults(func=cmd_put)
-
-    p = sub.add_parser("cp", help="copy files between images (streaming)")
+    p.add_argument("--comment", help="file comment")
     p.add_argument("--bulk", action="store_true",
                    help="batch metadata commits for mass copies (faster; "
                         "a crash mid-run may need `repair --write`)")
-    p.add_argument("src_image")
-    p.add_argument("src_path")
-    p.add_argument("dst_image")
-    p.add_argument("dst_path")
+    p.set_defaults(func=cmd_put)
+
+    p = sub.add_parser("cp", help="copy files (host <-> image or image <-> image)")
+    p.add_argument("--bulk", action="store_true",
+                   help="batch metadata commits for mass copies (faster; "
+                        "a crash mid-run may need `repair --write`)")
+    p.add_argument("src", help="source host path or image.hdf:Volume/path")
+    p.add_argument("dst", help="destination host path or image.hdf:Volume/path")
     p.add_argument("-r", "--recursive", action="store_true")
     p.add_argument("--checksum", action="store_true", help="calculate MD5 checksum while copying")
+    p.add_argument("--comment", help="file comment (host -> image only)")
+    p.add_argument("--protect", help="e.g. 'hsparwed' subset like '----rwed' (host -> image only)")
     p.set_defaults(func=cmd_cp)
 
     p = sub.add_parser("mkdir", help="create a directory")
-    p.add_argument("image")
-    p.add_argument("path")
+    p.add_argument("image", help="image.hdf:Volume/path")
     p.add_argument("-p", "--parents", action="store_true")
     p.set_defaults(func=cmd_mkdir)
 
-    p = sub.add_parser("rm", help="delete a file or directory")
-    p.add_argument("image")
-    p.add_argument("path")
+    p = sub.add_parser("rm", help="remove files or directories")
+    p.add_argument("image", help="image.hdf:Volume/path")
     p.add_argument("-r", "--recursive", action="store_true")
+    p.add_argument("-f", "--force", action="store_true")
     p.set_defaults(func=cmd_rm)
 
-    p = sub.add_parser("mv", help="rename/move within a volume")
-    p.add_argument("image")
-    p.add_argument("src")
-    p.add_argument("dst")
+    p = sub.add_parser("mv", help="rename a file or directory")
+    p.add_argument("src", help="image.hdf:Volume/src_path")
+    p.add_argument("dst", help="image.hdf:Volume/dst_path (or just dst_path if same volume)")
     p.set_defaults(func=cmd_mv)
 
     p = sub.add_parser("check", help="verify filesystem structures and bitmap")

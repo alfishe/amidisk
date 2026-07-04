@@ -31,7 +31,16 @@ class TarHandler(ArchiveHandler):
         try:
             with tarfile.open(self.path, "r") as tar:
                 for member in tar:
-                    parts = [truncate_func(p, max_len) for p in member.name.split("/")]
+                    name = member.name
+                    if name.startswith("./"):
+                        name = name[2:]
+                    elif name == ".":
+                        continue
+                        
+                    if not name:
+                        continue
+                        
+                    parts = [truncate_func(p, max_len) for p in name.split("/")]
                     rel_amiga = "/".join(parts)
                     
                     amiga_dir = base_amiga_path if rel_amiga == "." else (
