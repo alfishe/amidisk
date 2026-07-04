@@ -40,12 +40,33 @@ def human_size(n):
         n /= 1024.0
 
 
+def _parse_image_arg(image_arg, vol_arg=None):
+    """
+    Parses 'path/to/image:Volume' syntax, returning (path, volume).
+    Falls back to an explicit volume argument if provided.
+    """
+    if ":" in image_arg and not os.path.exists(image_arg):
+        path, vol = image_arg.rsplit(":", 1)
+        if os.path.exists(path):
+            return path, vol
+        path, vol = image_arg.split(":", 1)
+        return path, vol
+    return image_arg, vol_arg or ""
+
+
+def _combine_path(vol_name, path):
+    """Combines a parsed volume name and an optional path back into a volume:path string."""
+    path = path or ""
+    if not path:
+        return vol_name + ":" if vol_name else ""
+    if ":" not in path and vol_name:
+        return vol_name + ":" + path
+    return path
+
+
 # ---------------------------------------------------------------- info
 def cmd_info(args):
-    img_path = args.image
-    vol_name = ""
-    if ":" in img_path and not os.path.exists(img_path):
-        img_path, vol_name = img_path.split(":", 1)
+    img_path, vol_name = _parse_image_arg(args.image)
 
     with open_image(img_path) as img:
         info = img.get_info()
@@ -195,8 +216,9 @@ def cmd_info(args):
 
 # ---------------------------------------------------------------- ls
 def cmd_ls(args):
-    with open_image(args.image) as img:
-        vol_ref, path = img.parse_path(args.path or "")
+    img_path, vol_name = _parse_image_arg(args.image)
+    with open_image(img_path) as img:
+        vol_ref, path = img.parse_path(_combine_path(vol_name, args.path))
         vol = vol_ref.mount()
         entry = vol.resolve(path)
         entries = (
@@ -219,8 +241,9 @@ def cmd_ls(args):
 
 # ---------------------------------------------------------------- cat
 def cmd_cat(args):
-    with open_image(args.image) as img:
-        vol_ref, path = img.parse_path(args.path)
+    img_path, vol_name = _parse_image_arg(args.image)
+    with open_image(img_path) as img:
+        vol_ref, path = img.parse_path(_combine_path(vol_name, args.path))
         vol = vol_ref.mount()
         out = sys.stdout.buffer
         for chunk in vol.read_file(path):
@@ -243,8 +266,9 @@ def _safe_name(name):
 
 
 def cmd_extract(args):
-    with open_image(args.image) as img:
-        vol_ref, path = img.parse_path(args.path)
+    img_path, vol_name = _parse_image_arg(args.image)
+    with open_image(img_path) as img:
+        vol_ref, path = img.parse_path(_combine_path(vol_name, args.path))
         vol = vol_ref.mount()
         entry = vol.resolve(path)
         dest = args.dest
@@ -296,9 +320,11 @@ class ChecksumStream:
             raise
 
 def cmd_cp(args):
-    with open_image(args.src_image) as src_img, open_image(args.dst_image, writable=True) as dst_img:
-        src_vol_ref, src_path = src_img.parse_path(args.src_path)
-        dst_vol_ref, dst_path = dst_img.parse_path(args.dst_path)
+    img1, vol1 = _parse_image_arg(args.src_image)
+    img2, vol2 = _parse_image_arg(args.dst_image)
+    with open_image(img1) as src_img, open_image(img2, writable=True) as dst_img:
+        src_vol_ref, src_path = src_img.parse_path(_combine_path(vol1, args.src_path))
+        dst_vol_ref, dst_path = dst_img.parse_path(_combine_path(vol2, args.dst_path))
         
         src_vol = src_vol_ref.mount()
         dst_vol = dst_vol_ref.mount()
@@ -405,8 +431,9 @@ def cmd_put(args):
             print("error: invalid syntax or image not found. Use 'put image src dest' or 'put src image:dest'", file=sys.stderr)
             return 1
 
-    with open_image(args.image, writable=True) as img:
-        vol_ref, path = img.parse_path(args.dest)
+    img_path, vol_name = _parse_image_arg(args.image)
+    with open_image(img_path, writable=True) as img:
+        vol_ref, path = img.parse_path(_combine_path(vol_name, args.dest))
         vol = vol_ref.mount()
         protect = str_to_protect(args.protect) if args.protect else 0
         comment = args.comment.encode("latin-1") if args.comment else b""
@@ -500,8 +527,9 @@ def cmd_put(args):
 
 # ---------------------------------------------------------------- mkdir / rm / mv
 def cmd_mkdir(args):
-    with open_image(args.image, writable=True) as img:
-        vol_ref, path = img.parse_path(args.path)
+    img_path, vol_name = _parse_image_arg(args.image)
+    with open_image(img_path, writable=True) as img:
+        vol_ref, path = img.parse_path(_combine_path(vol_name, args.path))
         vol = vol_ref.mount()
         if args.parents:
             vol.makedirs(path)
@@ -512,8 +540,9 @@ def cmd_mkdir(args):
 
 
 def cmd_rm(args):
-    with open_image(args.image, writable=True) as img:
-        vol_ref, path = img.parse_path(args.path)
+    img_path, vol_name = _parse_image_arg(args.image)
+    with open_image(img_path, writable=True) as img:
+        vol_ref, path = img.parse_path(_combine_path(vol_name, args.path))
         vol = vol_ref.mount()
         vol.delete(path, recursive=args.recursive)
         print("deleted %s" % args.path)
@@ -521,9 +550,10 @@ def cmd_rm(args):
 
 
 def cmd_mv(args):
-    with open_image(args.image, writable=True) as img:
-        vol_ref, src = img.parse_path(args.src)
-        vol_ref2, dst = img.parse_path(args.dst)
+    img_path, vol_name = _parse_image_arg(args.image)
+    with open_image(img_path, writable=True) as img:
+        vol_ref, src = img.parse_path(_combine_path(vol_name, args.src))
+        vol_ref2, dst = img.parse_path(_combine_path(vol_name, args.dst))
         if vol_ref is not vol_ref2:
             print("error: mv works within one volume", file=sys.stderr)
             return 1
@@ -535,9 +565,10 @@ def cmd_mv(args):
 
 # ---------------------------------------------------------------- check
 def cmd_check(args):
+    img_path, vol_name = _parse_image_arg(args.image, getattr(args, "volume", None))
     rc = 0
-    with open_image(args.image) as img:
-        vols = [img.get_volume(args.volume)] if args.volume else img.volumes
+    with open_image(img_path) as img:
+        vols = [img.get_volume(vol_name)] if vol_name else img.volumes
         for v in vols:
             try:
                 vol = v.mount()
@@ -685,8 +716,9 @@ def cmd_create(args):
 
 
 def cmd_bootblock(args):
-    with open_image(args.image, writable=True) as img:
-        vol_ref = img.get_volume(getattr(args, "volume", None))
+    img_path, vol_name = _parse_image_arg(args.image, getattr(args, "volume", None))
+    with open_image(img_path, writable=True) as img:
+        vol_ref = img.get_volume(vol_name)
         
         with open(args.bootcode, "rb") as f:
             bootcode = f.read()
@@ -710,8 +742,9 @@ def cmd_bootblock(args):
 
 
 def cmd_format(args):
-    with open_image(args.image, writable=True) as img:
-        vol_ref = img.get_volume(getattr(args, "volume", None))
+    img_path, vol_name = _parse_image_arg(args.image, getattr(args, "volume", None))
+    with open_image(img_path, writable=True) as img:
+        vol_ref = img.get_volume(vol_name)
         
         dos_type = None
         if getattr(args, "dostype", None):
@@ -1043,12 +1076,13 @@ def cmd_repair(args):
     from .blkdev import open_blkdev, OverlayBlockDevice
     from .image import DiskImage
 
+    img_path, vol_name = _parse_image_arg(args.image, getattr(args, "volume", None))
     rc = 0
-    base = open_blkdev(args.image)
+    base = open_blkdev(img_path)
     try:
         overlay = OverlayBlockDevice(base)
-        sim = DiskImage(args.image, writable=True, blkdev=overlay)
-        vols = [sim.get_volume(args.volume)] if args.volume else sim.volumes
+        sim = DiskImage(img_path, writable=True, blkdev=overlay)
+        vols = [sim.get_volume(vol_name)] if vol_name else sim.volumes
         touched = False
         for v in vols:
             try:
@@ -1204,8 +1238,9 @@ def cmd_fs_extract(args):
 
 
 def cmd_bench(args):
-    with open_image(args.image) as img:
-        vol_ref, path = img.parse_path(args.path)
+    img_path, vol_name = _parse_image_arg(args.image)
+    with open_image(img_path) as img:
+        vol_ref, path = img.parse_path(_combine_path(vol_name, args.path))
         vol = vol_ref.mount()
         
         start_time = time.time()
@@ -1339,7 +1374,7 @@ def main(argv=None):
     p.add_argument("image")
     p.add_argument("name", help="drive name, e.g. DH0")
     p.add_argument("--size", help="e.g. 500M (default: all remaining space)")
-    p.add_argument("--dostype", help="ofs|ffs|ffs-intl|... or hex dostype")
+    p.add_argument("--dostype", help="ofs|ffs|ffs-intl|... or a raw hex 32-bit identifier (e.g. 0x444f5303 for DOS\\3)")
     p.add_argument("--bs", type=int, default=512, help="fs block size (512..32768)")
     p.add_argument("--bootable", action="store_true")
     p.add_argument("--pri", type=int, default=0, help="boot priority")
@@ -1354,7 +1389,7 @@ def main(argv=None):
     )
     p.add_argument("image")
     p.add_argument("driver", help="path to the driver, e.g. pfs3aio")
-    p.add_argument("--dostype", required=True, help="pfs3|sfs|... or hex")
+    p.add_argument("--dostype", required=True, help="pfs3|sfs|... or a raw hex 32-bit identifier (e.g. 0x50465303 for PFS\\3)")
     p.add_argument("--version", help="M.R override (default: parse $VER)")
     p.add_argument("--patch-flags", default="0x180")
     p.set_defaults(func=cmd_fs_add)
@@ -1370,7 +1405,7 @@ def main(argv=None):
     p.add_argument("--size", default="10M", help="image size, e.g. 100M, 1G")
     p.add_argument("--adf", action="store_true", help="880K floppy image")
     p.add_argument("--format", metavar="LABEL", help="format after creating")
-    p.add_argument("--dostype", help="ofs|ffs|ofs-intl|ffs-intl or hex")
+    p.add_argument("--dostype", help="ofs|ffs|ofs-intl|ffs-intl or a raw hex 32-bit identifier (e.g. 0x444f5303 for DOS\\3)")
     p.add_argument("--layout", help="Init RDB (e.g. DH0:*:ffs:System:boot) or 'default'")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_create)
@@ -1385,7 +1420,7 @@ def main(argv=None):
     p.add_argument("image")
     p.add_argument("label")
     p.add_argument("--volume", help="partition to format (drive name/index)")
-    p.add_argument("--dostype", help="ofs|ffs|ofs-intl|ffs-intl or hex")
+    p.add_argument("--dostype", help="ofs|ffs|ofs-intl|ffs-intl or a raw hex 32-bit identifier (e.g. 0x444f5303 for DOS\\3)")
     p.set_defaults(func=cmd_format)
 
     p = sub.add_parser("rdb-scan", help="scan a disk for lost partitions (overwritten RDB)")
@@ -1418,6 +1453,30 @@ def main(argv=None):
     p.add_argument("--num", type=int)
     p.add_argument("--out")
     p.set_defaults(func=cmd_fs_extract)
+
+    p = sub.add_parser("help", help="show detailed help for a specific command (or 'all')")
+    p.add_argument("command", nargs="?", help="command name, or 'all' for every command")
+    
+    def run_help(args):
+        if args.command == "all":
+            ap.print_help()
+            for name, parser in sub.choices.items():
+                if name != "help":
+                    print(f"\n{'='*60}\nCommand: {name}\n{'='*60}")
+                    parser.print_help()
+            return 0
+        elif args.command:
+            if args.command in sub.choices:
+                sub.choices[args.command].print_help()
+                return 0
+            else:
+                print(f"error: unknown command '{args.command}'", file=sys.stderr)
+                return 1
+        else:
+            ap.print_help()
+            return 0
+            
+    p.set_defaults(func=run_help)
 
     args = ap.parse_args(argv)
     try:
