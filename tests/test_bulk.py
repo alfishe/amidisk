@@ -82,32 +82,32 @@ class TestBulk(unittest.TestCase):
         self.assertTrue(rep["ok"], rep["errors"][:4])
         self.assertEqual(rep["files"], 20)
 
-    def test_ffs_crash_is_detectable_and_repairable(self):
-        """Simulated crash: skip bulk's exit flush entirely. The volume
-        must come up marked not-validated, check must flag it, and
-        repair must restore full consistency."""
-        p = os.path.join(self.tmp, "crash.hdf")
+    def _crash_mid_bulk(self, nocache):
+        p = os.path.join(self.tmp, "crash%d.hdf" % nocache)
         with open(p, "wb") as fh:
             fh.truncate(32 * 1024 * 1024)
-        dev = ImageFileBlkDev(p, read_only=False)
+        dev = ImageFileBlkDev(p, read_only=False, nocache=nocache)
         FFSVolume(dev, dos_type=0x444F5303).format(b"C", dos_type=0x444F5303)
         vol = FFSVolume(dev, dos_type=0x444F5303).open()
         ctx = vol.bulk(flush_every=10_000)  # never reaches a batch point
         ctx.__enter__()
         for i in range(50):
             vol.write_file("f%d" % i, os.urandom(2000))
-        # crash: close the device out from under the context, then let
-        # its exit flush fail -- equivalent to dying before the commit
         dev.flush()
         dev.close()
         try:
             ctx.__exit__(None, None, None)
         except ValueError:
             pass  # flush against a closed device: the simulated crash
+        return p
 
+    def test_ffs_crash_pagecached_detectable_and_repairable(self):
+        """Page-cached bulk: metadata lands per-file, bitmap is stale.
+        Crash must be detected by check and fixed by repair with no
+        file loss."""
+        p = self._crash_mid_bulk(nocache=False)
         dev = ImageFileBlkDev(p, read_only=False)
         vol2 = FFSVolume(dev, dos_type=0x444F5303).open()
-        # bm_flag must still say 'not validated'
         root = vol2.read_buf(vol2.root_blk)
         self.assertEqual(root.slong(-50), 0, "bm_flag should be invalid")
         rep = vol2.check()
@@ -119,6 +119,27 @@ class TestBulk(unittest.TestCase):
         self.assertEqual(rep["files"], 50)  # nothing lost, all repaired
         for i in (0, 25, 49):
             self.assertEqual(len(vol2.read_file_bytes("f%d" % i)), 2000)
+        dev.close()
+
+    def test_ffs_crash_nocache_rolls_back_atomically(self):
+        """Uncached bulk uses the write cache: a crash loses the RAM
+        batch wholesale -- the on-disk volume stays CONSISTENT, marked
+        not-validated, and repair revalidates it."""
+        p = self._crash_mid_bulk(nocache=True)
+        dev = ImageFileBlkDev(p, read_only=False)
+        vol2 = FFSVolume(dev, dos_type=0x444F5303).open()
+        root = vol2.read_buf(vol2.root_blk)
+        self.assertEqual(root.slong(-50), 0, "bm_flag should be invalid")
+        rep = vol2.check(deep=True)
+        self.assertTrue(rep["ok"], rep["errors"][:4])
+        self.assertTrue(any("not validated" in w for w in rep["warnings"]),
+                        rep["warnings"])
+        self.assertEqual(rep["files"], 0)  # batch rolled back atomically
+        fix = vol2.repair(apply=True)
+        self.assertTrue(fix["applied"])
+        rep = vol2.check(deep=True)
+        self.assertTrue(rep["ok"], rep["errors"][:4])
+        self.assertFalse(rep["warnings"], rep["warnings"])
         dev.close()
 
     def test_default_mode_unchanged(self):

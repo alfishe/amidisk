@@ -1358,6 +1358,14 @@ class SFSVolume:
             self._bulk_depth = getattr(self, "_bulk_depth", 0) + 1
             self._bulk_every = max(1, flush_every)
             self._bulk_ops = 0
+            if self._bulk_depth == 1:
+                from ..blkdev import BulkWriteCache
+                if (not isinstance(self.dev, BulkWriteCache)
+                        and getattr(self.dev, "_nocache", False)):
+                    # page-cached devices already coalesce small writes
+                    # in the kernel; the RAM cache only pays off when
+                    # the OS cache is bypassed (real devices, F_NOCACHE)
+                    self.dev = BulkWriteCache(self.dev)
             try:
                 yield self
             finally:
@@ -1365,6 +1373,11 @@ class SFSVolume:
                 if self._bulk_depth == 0:
                     self._write_freeblocks()
                     self._write_volume_date()
+                    from ..blkdev import BulkWriteCache
+                    if isinstance(self.dev, BulkWriteCache):
+                        cache = self.dev
+                        self.dev = cache.base
+                        cache.flush_cache()
 
         return _ctx()
 

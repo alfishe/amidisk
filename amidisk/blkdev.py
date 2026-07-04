@@ -417,3 +417,130 @@ def alloc_read_buffer(size):
         import mmap
         return mmap.mmap(-1, size)
     return bytearray(size)
+
+
+class BulkWriteCache:
+    """Write-back cache for bulk imports: absorbs the small metadata and
+    file writes an import generates (header + data + directory rewrite
+    per file) and flushes them as large, sorted, coalesced sequential
+    writes. Activated by the engines' bulk() mode; the crash window is
+    the same contract bulk() already documents.
+
+    Small writes (<=8 blocks) live in a per-block dict so rewrites of
+    the same block (directory updates, hash-chain links) merge for
+    free. Large writes (data runs, ext chains) are kept whole in a
+    sorted segment list -- the allocators hand out distinct blocks, and
+    reads verify overlap instead of assuming it cannot happen.
+    """
+
+    def __init__(self, base, flush_threshold=512 << 20):
+        self.base = base
+        self.block_bytes = base.block_bytes
+        self.num_blocks = base.num_blocks
+        self.read_only = base.read_only
+        self._small = {}            # blocknr -> bytes(block)
+        self._big = []              # sorted [(start_blk, nblocks, bytes)]
+        self._big_starts = []
+        self._pending = 0
+        self._threshold = flush_threshold
+
+    def __getattr__(self, name):
+        return getattr(self.base, name)
+
+    def _big_lookup(self, blk):
+        import bisect
+        i = bisect.bisect_right(self._big_starts, blk) - 1
+        if i >= 0:
+            s, n, data = self._big[i]
+            if s <= blk < s + n:
+                return data[(blk - s) * self.block_bytes :
+                            (blk - s + 1) * self.block_bytes]
+        return None
+
+    def write(self, lba, data):
+        bb = self.block_bytes
+        n = len(data) // bb
+        if n <= 8:
+            for i in range(n):
+                self._small[lba + i] = bytes(data[i * bb : (i + 1) * bb])
+        else:
+            import bisect
+            i = bisect.bisect_right(self._big_starts, lba)
+            self._big.insert(i, (lba, n, bytes(data)))
+            self._big_starts.insert(i, lba)
+            for b in range(lba, lba + n):
+                self._small.pop(b, None)
+        self._pending += len(data)
+        if self._pending >= self._threshold:
+            self.flush_cache()
+
+    def read(self, lba, count=1):
+        bb = self.block_bytes
+        if not self._small and not self._big:
+            return self.base.read(lba, count)
+        if count <= 256:
+            parts = []
+            base_run = None  # (start, n) of underlying blocks to fetch
+            out = []
+            for b in range(lba, lba + count):
+                blk = self._small.get(b)
+                if blk is None:
+                    blk = self._big_lookup(b)
+                out.append(blk)
+            if all(p is not None for p in out):
+                return b"".join(out)
+            if all(p is None for p in out):
+                return self.base.read(lba, count)
+            under = self.base.read(lba, count)
+            return b"".join(
+                out[i] if out[i] is not None
+                else under[i * bb : (i + 1) * bb]
+                for i in range(count))
+        # large read: cheapest correct path is flush-then-read-through
+        self.flush_cache()
+        return self.base.read(lba, count)
+
+    def read_into(self, lba, out):
+        if self._small or self._big:
+            self.flush_cache()
+        return self.base.read_into(lba, out)
+
+    def pread_into(self, lba, out):
+        if self._small or self._big:
+            self.flush_cache()
+        return self.base.pread_into(lba, out)
+
+    def flush_cache(self):
+        """Dump everything as sorted, coalesced sequential writes."""
+        bb = self.block_bytes
+        items = [(b, 1, d) for b, d in self._small.items()] + self._big
+        items.sort(key=lambda t: t[0])
+        i = 0
+        MAXRUN = 32 << 20
+        while i < len(items):
+            start = items[i][0]
+            parts = [items[i][2]]
+            size = len(items[i][2])
+            end = start + items[i][1]
+            j = i + 1
+            while (j < len(items) and items[j][0] == end
+                   and size + len(items[j][2]) <= MAXRUN):
+                parts.append(items[j][2])
+                size += len(items[j][2])
+                end += items[j][1]
+                j += 1
+            self.base.write(start, b"".join(parts) if len(parts) > 1
+                            else parts[0])
+            i = j
+        self._small.clear()
+        self._big = []
+        self._big_starts = []
+        self._pending = 0
+
+    def flush(self):
+        self.flush_cache()
+        self.base.flush()
+
+    def close(self):
+        self.flush_cache()
+        self.base.close()

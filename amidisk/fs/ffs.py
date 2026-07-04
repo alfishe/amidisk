@@ -92,10 +92,7 @@ class BlockBuf:
         self.data[byte_off + 1 : byte_off + 1 + max_chars] = val.ljust(max_chars, b"\x00")
 
     def sum_longs(self):
-        s = 0
-        for (v,) in struct.iter_unpack(">I", bytes(self.data)):
-            s = (s + v) & 0xFFFFFFFF
-        return s
+        return sum(struct.unpack_from(">%dI" % self.nl, self.data)) & 0xFFFFFFFF
 
     def fix_checksum(self, chk_long=5):
         self.put_long(chk_long, 0)
@@ -608,10 +605,47 @@ class FFSVolume:
         self._fill_comment(cur)
         return cur
 
+    def _dir_name_set(self, dir_buf):
+        """Cached set of (case-folded) names in a directory: bulk imports
+        answer 'does this exist?' in O(1) instead of a chain walk.
+        Invalidated on unlink and directory deletion (block reuse)."""
+        dir_blk = dir_buf.long(1) if dir_buf.long(1) else self.root_blk
+        idx = getattr(self, "_dir_names_cache", None)
+        if idx is None:
+            idx = self._dir_names_cache = {}
+        names = idx.get(dir_blk)
+        if names is None:
+            names = set()
+            bs = self.bs
+            for h in range(self.tsz):
+                blk = dir_buf.long(6 + h)
+                guard = 0
+                while blk:
+                    guard += 1
+                    if guard > MAX_CHAIN:
+                        raise FSError("cyclic hash chain")
+                    raw = self.dev.read(blk * self.spb, self.spb)
+                    if self.is_longname:
+                        nl_ = min(raw[bs - 184], 107)
+                        nm = raw[bs - 183 : bs - 183 + nl_]
+                    else:
+                        nl_ = min(raw[bs - 80], MAX_NAME)
+                        nm = raw[bs - 79 : bs - 79 + nl_]
+                    names.add(self._fold(nm))
+                    blk = struct.unpack_from(">I", raw, bs - 16)[0]
+            idx[dir_blk] = names
+        return names
+
+    def _fold(self, name):
+        from .util import upper_char
+        return bytes(upper_char(c, self.intl) for c in name)
+
     def _find_in_dir(self, dir_buf, name):
         """Hash-chain lookup. Chain nodes are compared by extracting only
         the name and chain pointer from the raw block; the full Entry is
         parsed once, for the match -- chain walks dominate bulk imports."""
+        if self._fold(bytes(name)) not in self._dir_name_set(dir_buf):
+            return None
         h = hash_name(name, self.tsz, self.intl)
         blk = dir_buf.long(6 + h)
         guard = 0
@@ -886,6 +920,13 @@ class FFSVolume:
                 root.put_slong(-50, 0)  # bm_flag: bitmap not valid
                 root.fix_checksum()
                 self.write_buf(self.root_blk, root)
+                from ..blkdev import BulkWriteCache
+                if (not isinstance(self.dev, BulkWriteCache)
+                        and getattr(self.dev, "_nocache", False)):
+                    # page-cached devices already coalesce small writes
+                    # in the kernel; the RAM cache only pays off when
+                    # the OS cache is bypassed (real devices, F_NOCACHE)
+                    self.dev = BulkWriteCache(self.dev)
             try:
                 yield self
             finally:
@@ -897,6 +938,11 @@ class FFSVolume:
                     root.fix_checksum()
                     self.write_buf(self.root_blk, root)
                     self._touch_volume()
+                    from ..blkdev import BulkWriteCache
+                    if isinstance(self.dev, BulkWriteCache):
+                        cache = self.dev
+                        self.dev = cache.base
+                        cache.flush_cache()
 
         return _ctx()
 
@@ -997,8 +1043,14 @@ class FFSVolume:
         self._now_stamp(dbuf, self._date_loc(dir_blk))
         dbuf.fix_checksum()
         self.write_buf(dir_blk, dbuf)
+        c = getattr(self, "_dir_names_cache", None)
+        if c is not None and dir_blk in c:
+            c[dir_blk].add(self._fold(bytes(name)))
 
     def _unlink_entry(self, entry):
+        c = getattr(self, "_dir_names_cache", None)
+        if c is not None:
+            c.clear()  # offsets/chains change; dir blocks may be reused
         """Remove entry from its parent's hash chain."""
         dir_blk = entry.parent
         h = hash_name(entry.name, self.tsz, self.intl)
@@ -1420,6 +1472,8 @@ class FFSVolume:
         self._unlink_entry(entry)
         if getattr(self, "_dircache", None):
             self._dircache.clear()
+        if getattr(self, "_dir_names_cache", None):
+            self._dir_names_cache.clear()
         self.bitmap.free(self._entry_blocks(entry))
         self._update_dircache(entry.parent)
         self._commit_meta()
@@ -1431,6 +1485,8 @@ class FFSVolume:
             raise FSError("cannot rename the root directory")
         if getattr(self, "_dircache", None):
             self._dircache.clear()
+        if getattr(self, "_dir_names_cache", None):
+            self._dir_names_cache.clear()
         new_parent, new_name = self._resolve_parent(dst)
         dbuf = self.read_buf(new_parent.blk)
         clash = self._find_in_dir(dbuf, new_name)
@@ -1634,14 +1690,17 @@ class FFSVolume:
             "problems": problems,
             "applied": False,
         }
-        if apply and (wrong_free or wrong_used):
+        root = self.read_buf(self.root_blk)
+        flag_invalid = root.slong(-50) == 0
+        report["not_validated"] = flag_invalid
+        if apply and (wrong_free or wrong_used or flag_invalid):
             for blk in wrong_free:
                 self.bitmap._set(blk, False)
             for blk in wrong_used:
                 self.bitmap._set(blk, True)
             self.bitmap.flush()
-            # bm_flag: mark bitmap valid again
-            root = self.read_buf(self.root_blk)
+            # bm_flag: mark bitmap valid again (also when the only issue
+            # was an interrupted bulk update that left bm_flag=0)
             root.put_slong(-50, -1)
             root.fix_checksum()
             self.write_buf(self.root_blk, root)
@@ -1699,6 +1758,10 @@ class FFSVolume:
         root = self.read_buf(self.root_blk)
         if not root.checksum_ok():
             errors.append("root block checksum invalid")
+        if root.slong(-50) == 0:
+            warnings.append(
+                "bitmap marked not validated (bm_flag=0): the volume was "
+                "interrupted mid-update; run repair --write to revalidate")
         mark(self.root_blk, "root")
         for pi, pblk in enumerate(self.bitmap.page_blks):
             mark(pblk, "bitmap page %d" % pi)
