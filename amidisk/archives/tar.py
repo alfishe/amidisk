@@ -66,9 +66,16 @@ class TarHandler(ArchiveHandler):
                             )
                             n += 1
                             total_bytes += member.size
-                    # Update progress using the underlying tarfile read cursor
+                    # Update progress: percentage from archive position,
+                    # but display actual content bytes to match final stats
                     if tar.fileobj:
-                        print_progress(tar.fileobj.tell(), total_archive_size, parts[-1])
+                        pos = tar.fileobj.tell()
+                        # Estimate total content from current ratio
+                        if pos > 0:
+                            est_total = int(total_bytes * total_archive_size / pos)
+                        else:
+                            est_total = total_archive_size
+                        print_progress(total_bytes, est_total, parts[-1])
                         
         except Exception as e:
             print("") # newline to lock progress bar before error message

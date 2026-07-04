@@ -26,14 +26,12 @@ def print_progress(current_bytes, total_bytes, current_file=""):
     import time
     now = time.time()
     last_t = getattr(print_progress, "_last_t", 0)
-    last_p = getattr(print_progress, "_last_p", -1)
     
-    # Throttle: print only if 1% boundary crossed, or 0.1s elapsed, or if complete
-    if current_bytes < total_bytes and (now - last_t < 0.1) and int(percent) == int(last_p):
+    # Throttle: print at most every 250ms, or on completion
+    if current_bytes < total_bytes and (now - last_t < 0.25):
         return
         
     print_progress._last_t = now
-    print_progress._last_p = percent
 
     bar_len = 30
     filled = int((percent / 100) * bar_len) if percent <= 100 else bar_len
