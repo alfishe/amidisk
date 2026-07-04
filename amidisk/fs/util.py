@@ -3,8 +3,20 @@
 from datetime import datetime, timedelta
 
 # AmigaDOS epoch
+# Cache epoch to avoid constructing it repeatedly
 EPOCH = datetime(1978, 1, 1)
 TICKS_PER_SEC = 50
+
+# Precomputed 256-byte translation tables for fast toupper folding at C-speed
+UPPER_TABLE_STD = bytes(
+    (c - 0x20) if (0x61 <= c <= 0x7A) else c
+    for c in range(256)
+)
+
+UPPER_TABLE_INTL = bytes(
+    (c - 0x20) if (0x61 <= c <= 0x7A) or (0xE0 <= c <= 0xFE and c != 0xF7) else c
+    for c in range(256)
+)
 
 
 def amiga_to_datetime(days, mins, ticks):
@@ -68,12 +80,12 @@ def upper_char(c, intl):
 def hash_name(name, ht_size, intl):
     """AmigaDOS directory hash for a name (bytes)."""
     h = len(name)
-    for c in name:
-        h = (h * 13 + upper_char(c, intl)) & 0x7FF
+    table = UPPER_TABLE_INTL if intl else UPPER_TABLE_STD
+    for c in name.translate(table):
+        h = (h * 13 + c) & 0x7FF
     return h % ht_size
 
 
 def names_equal(a, b, intl):
-    if len(a) != len(b):
-        return False
-    return all(upper_char(x, intl) == upper_char(y, intl) for x, y in zip(a, b))
+    table = UPPER_TABLE_INTL if intl else UPPER_TABLE_STD
+    return a.translate(table) == b.translate(table)

@@ -637,8 +637,9 @@ class FFSVolume:
         return names
 
     def _fold(self, name):
-        from .util import upper_char
-        return bytes(upper_char(c, self.intl) for c in name)
+        from .util import UPPER_TABLE_INTL, UPPER_TABLE_STD
+        table = UPPER_TABLE_INTL if self.intl else UPPER_TABLE_STD
+        return name.translate(table)
 
     def _find_in_dir(self, dir_buf, name):
         """Hash-chain lookup. Chain nodes are compared by extracting only
