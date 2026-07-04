@@ -81,13 +81,13 @@ Here is where our baseline performance started. After proving the mathematical c
 
 | Engine | write | % of device | read | % of device | create f/s | notes |
 |---|---|---|---|---|---|---|
-| OFS (DOS\0) | 38 MB/s | 1% | 421 MB/s | 17% | 2539 | writes format-bound (per-block embedded checksummed headers) |
-| FFS (DOS\3) | 1736 MB/s | 56% | 929 MB/s | 38% | 6915 | run coalescing, O(1) free count, table slicing, ext-block batching |
-| FFS (4 K blocks) | 2808 MB/s | 91% | 1587 MB/s | 64% | 2506 | same changes; 91% of device write ceiling |
-| FFS-DC (DOS\5) | 1694 MB/s | 55% | 903 MB/s | 36% | 963 | shares the FFS data path; dircache cost hits metadata ops only |
-| FFS-LNFS (DOS\7) | 1696 MB/s | 55% | 947 MB/s | 38% | 7022 | shares the FFS data path |
-| PFS3 | 1971 MB/s | 64% | 1033 MB/s | 42% | 8045 | zero-copy writes, allocator word-grab, per-dir caches |
-| SFS | 2769 MB/s | 90% | 928 MB/s | 37% | 2561 | zero-copy writes, byte-fill bitmap, roving cursor, per-dir caches |
+| OFS (DOS\0) | 36 MB/s | 1% | 433 MB/s | 15% | 2290 | format-bound: per-block embedded checksummed headers |
+| FFS (DOS\3) | 1945 MB/s | 63% | 1978 MB/s | 70% | 4625 | at the 512-byte format floor: 5 690 interleaved pointer tables per 200 MB |
+| FFS (4 K blocks) | 2791 MB/s | 90% | 2434 MB/s | 86% | 2149 | the format's own answer to the 512 B floor -- target met both directions |
+| FFS-DC (DOS\5) | 1904 MB/s | 62% | 1999 MB/s | 71% | 842 | FFS data path; dircache costs hit creates only |
+| FFS-LNFS (DOS\7) | 1810 MB/s | 58% | 1900 MB/s | 67% | 4515 | FFS data path + long-name handling |
+| PFS3 | 2649 MB/s | 86% | 2449 MB/s | 87% | 4498 | target met both directions |
+| SFS | 2730 MB/s | 88% | 2182 MB/s | 77% | 2105 | reads capped by u16 extents (32 MB) forcing buffer assembly |
 
 Looking at this baseline data, we can draw three major conclusions about how the raw filesystem architectures limit performance:
 
@@ -165,10 +165,26 @@ Observations, read against the yardstick:
 - PFS3 and SFS writes are now the largest remaining gap; both would
   benefit from the same word-granular bitmap updates FFS received.
 
-Measured 2026-07-04, device regime (F_NOCACHE on the image files),
-baseline and all rows in one session. Historical tables earlier in
-this document were measured cache-hot and are kept for the narrative;
-only this table represents real-media performance.
+Measured 2026-07-04, device regime (F_NOCACHE both sides), median of
+three interleaved rounds with the baseline re-measured each round
+(medians: 3 094 MB/s write, 2 819 MB/s read at 16 MB requests). The
+drive's own state contributes +-15% run-to-run variance -- single
+measurements at this precision are meaningless, which is why every
+figure here is a median with a same-round yardstick.
+
+**The 80%-of-raw target.** Met for both directions by FFS 4 K, PFS3,
+and SFS writes; SFS reads reach 77% (u16 extent size limit forces
+multi-buffer assembly). The 512-byte FFS variants plateau at 58-71%:
+that is the format floor, not engine overhead -- a 200 MB file
+requires 5 690 interleaved 72-entry pointer tables that must be built,
+checksummed, and written between the data runs. The format's own
+answer is 4 K blocks (90%/86%). OFS remains format-bound (every data
+block carries an embedded checksummed header) and is exempt from the
+target. Key mechanisms that got the fast engines there: 16 MB device
+requests (the controller needs them to pipeline), fresh-page single
+reads for contiguous files, runs-based allocation with whole-page
+bitmap grabs, coalesced metadata flushes, and eliminating every
+full-payload copy on both paths.
 
 The SSD baseline and all engine rows above were measured in the same
 session — percentages are only meaningful against a same-day yardstick
