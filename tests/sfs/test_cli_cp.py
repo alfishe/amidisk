@@ -39,10 +39,8 @@ class TestCliCopy(unittest.TestCase):
         
     def test_cp_sfs_to_sfs(self):
         args = MockArgs()
-        args.src_image = "tests/sfs/src.hdf"
-        args.src_path = "test.txt"
-        args.dst_image = "tests/sfs/dst.hdf"
-        args.dst_path = "test_copied.txt"
+        args.src = "tests/sfs/src.hdf:test.txt"
+        args.dst = "tests/sfs/dst.hdf:test_copied.txt"
         args.recursive = False
         args.checksum = False
         

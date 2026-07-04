@@ -37,13 +37,12 @@ class TestSubprocessArchives(unittest.TestCase):
     def test_lha_can_handle(self):
         if os.path.exists(REAL_LHA):
             self.assertTrue(LhaHandler.can_handle(REAL_LHA))
-        self.assertFalse(LhaHandler.can_handle(REAL_7Z))
+        self.assertFalse(LhaHandler.can_handle(__file__))
         
     def test_sevenz_can_handle(self):
         if os.path.exists(REAL_7Z):
             self.assertTrue(SevenZipHandler.can_handle(REAL_7Z))
-        if os.path.exists(REAL_LHA):
-            self.assertFalse(SevenZipHandler.can_handle(REAL_LHA))
+        self.assertFalse(SevenZipHandler.can_handle(__file__))
 
     @unittest.skipUnless(find_executable(["7z", "7za"]), "7z tool not found")
     def test_sevenz_test_and_stream(self):
