@@ -25,6 +25,14 @@ Before any emulated filesystem-specific measurements, let's get an SSD performan
 | sequential, 4 MB chunks | **3 035 MB/s** | **6 637 MB/s** | the host ceiling — 100% below |
 | sequential, 512 B calls | 562 MB/s | 2 264 MB/s | 81% write loss, 66% read loss (syscall overhead) |
 | 512 B with seek per block | 195 MB/s | 1 253 MB/s | 94% write loss, 81% read loss (the legacy filesystem access pattern) |
+| device read, page cache bypassed (`F_NOCACHE`) | — | 6 383 MB/s | validates the read ceiling: this TB4/NVMe array genuinely sustains ~6.4 GB/s, so cache-hot numbers are not inflated |
+
+A fair objection to the read ceiling: cache-hot reads measure RAM, not
+the SSD. The `F_NOCACHE` row answers it — on this hardware the device
+itself sustains 6.4 GB/s sequential reads, within 4% of the cached
+figure, so read percentages below are valid against the physical
+device too. (On a typical single NVMe stick at ~3 GB/s the same
+engines would rate roughly twice as high.)
 
 That third row tells the real story: just by mimicking the Amiga's classic pattern of seeking and reading one 512-byte block at a time, we throw away 94% of our write speed and 81% of our read speed before the filesystem even begins to process data. This means that any engine relying on block-by-block I/O has a hard ceiling of 195 MB/s for writes and ~1 250 MB/s for reads, no matter how highly optimized the rest of its code might be.
 
