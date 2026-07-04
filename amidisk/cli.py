@@ -244,18 +244,22 @@ def cmd_ls(args):
         entries = (
             vol.list_dir(path) if entry.is_dir() else [entry]
         )
+        if not entries:
+            print("(empty)")
+            return 0
+            
         if args.json:
             print(json.dumps([e.get_info() for e in entries], indent=2))
-            return 0
-        for e in entries:
-            i = e.get_info()
-            size = "" if i["size"] is None else str(i["size"])
-            name = i["name"] + ("/" if e.is_dir() else "")
-            comment = ("  ; " + i["comment"]) if i["comment"] else ""
-            print(
-                "%s %10s  %s  %s%s"
-                % (i["protect"], size, i["mtime"], name, comment)
-            )
+        else:
+            for e in entries:
+                i = e.get_info()
+                size = "" if i["size"] is None else str(i["size"])
+                name = i["name"] + ("/" if e.is_dir() else "")
+                comment = ("  ; " + i["comment"]) if i["comment"] else ""
+                print(
+                    "%s %10s  %s  %s%s"
+                    % (i["protect"], size, i["mtime"], name, comment)
+                )
     return 0
 
 
