@@ -1,5 +1,9 @@
 import os
-import pytest
+import unittest
+try:
+    import pytest
+except ImportError:  # keep the suite runnable without pytest installed
+    raise unittest.SkipTest("pytest not installed")
 from amidisk.blkdev import ImageFileBlkDev
 from amidisk.fs.ffs import FFSVolume
 from amidisk.fs.sfs import SFSVolume

@@ -82,15 +82,20 @@ class TestBulk(unittest.TestCase):
         self.assertTrue(rep["ok"], rep["errors"][:4])
         self.assertEqual(rep["files"], 20)
 
-    def _crash_mid_bulk(self, nocache):
-        p = os.path.join(self.tmp, "crash%d.hdf" % nocache)
+    def _crash_mid_bulk(self, wrap_cache):
+        p = os.path.join(self.tmp, "crash%d.hdf" % wrap_cache)
         with open(p, "wb") as fh:
             fh.truncate(32 * 1024 * 1024)
-        dev = ImageFileBlkDev(p, read_only=False, nocache=nocache)
+        dev = ImageFileBlkDev(p, read_only=False)
         FFSVolume(dev, dos_type=0x444F5303).format(b"C", dos_type=0x444F5303)
         vol = FFSVolume(dev, dos_type=0x444F5303).open()
         ctx = vol.bulk(flush_every=10_000)  # never reaches a batch point
         ctx.__enter__()
+        if wrap_cache:
+            # wrap after entering bulk so the not-validated marker is
+            # already on disk (matches how activation used to order it)
+            from amidisk.blkdev import BulkWriteCache
+            vol.dev = BulkWriteCache(vol.dev)
         for i in range(50):
             vol.write_file("f%d" % i, os.urandom(2000))
         dev.flush()
@@ -106,7 +111,7 @@ class TestBulk(unittest.TestCase):
         a crash leaves written-but-unlinked headers as plain free space.
         The volume must be consistent, marked not-validated, and repair
         must revalidate it."""
-        p = self._crash_mid_bulk(nocache=False)
+        p = self._crash_mid_bulk(wrap_cache=False)
         dev = ImageFileBlkDev(p, read_only=False)
         vol2 = FFSVolume(dev, dos_type=0x444F5303).open()
         root = vol2.read_buf(vol2.root_blk)
@@ -123,11 +128,11 @@ class TestBulk(unittest.TestCase):
         self.assertFalse(rep["warnings"], rep["warnings"])
         dev.close()
 
-    def test_ffs_crash_nocache_rolls_back_atomically(self):
-        """Uncached bulk uses the write cache: a crash loses the RAM
+    def test_ffs_crash_with_write_cache_rolls_back_atomically(self):
+        """With an explicit BulkWriteCache wrap, a crash loses the RAM
         batch wholesale -- the on-disk volume stays CONSISTENT, marked
         not-validated, and repair revalidates it."""
-        p = self._crash_mid_bulk(nocache=True)
+        p = self._crash_mid_bulk(wrap_cache=True)
         dev = ImageFileBlkDev(p, read_only=False)
         vol2 = FFSVolume(dev, dos_type=0x444F5303).open()
         root = vol2.read_buf(vol2.root_blk)

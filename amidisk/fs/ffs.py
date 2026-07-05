@@ -936,13 +936,6 @@ class FFSVolume:
                 root.fix_checksum()
                 self.write_buf(self.root_blk, root)
                 self._dirty_dirs = {}
-                from ..blkdev import BulkWriteCache
-                if (not isinstance(self.dev, BulkWriteCache)
-                        and getattr(self.dev, "_nocache", False)):
-                    # page-cached devices already coalesce small writes
-                    # in the kernel; the RAM cache only pays off when
-                    # the OS cache is bypassed (real devices, F_NOCACHE)
-                    self.dev = BulkWriteCache(self.dev)
             try:
                 yield self
             finally:
@@ -956,11 +949,6 @@ class FFSVolume:
                     root.fix_checksum()
                     self.write_buf(self.root_blk, root)
                     self._touch_volume()
-                    from ..blkdev import BulkWriteCache
-                    if isinstance(self.dev, BulkWriteCache):
-                        cache = self.dev
-                        self.dev = cache.base
-                        cache.flush_cache()
 
         return _ctx()
 

@@ -46,27 +46,32 @@ class BlockDevice:
 class ImageFileBlkDev(BlockDevice):
     """Raw image file (HDF, ADF, .img): a flat array of sectors."""
 
-    def __init__(self, path, read_only=True, block_bytes=512, nocache=False):
+    def __init__(self, path, read_only=True, block_bytes=512):
         self.path = path
         self.read_only = read_only
         self.block_bytes = block_bytes
         mode = "rb" if read_only else "r+b"
         self.fh = open(path, mode)
-        self._nocache = nocache
         self._mm = None
         mm_env = os.environ.get("AMIDISK_MMAP")
         want_mm = mm_env == "1"
-        if mm_env is None and not read_only and not nocache:
+        if mm_env is None and not read_only:
             # auto-policy: mmap fully-allocated images (page-fault writes
             # beat per-call syscalls ~20%; no allocation can fail, so no
             # SIGBUS-on-disk-full risk). Sparse images keep the syscall
             # path, whose disk-full failure mode is a clean exception.
             try:
                 st = os.stat(path)
-                want_mm = st.st_blocks * 512 >= st.st_size * 99 // 100
+                blocks = getattr(st, "st_blocks", None)
+                if blocks is None:
+                    # Windows: no sparse detection via stat; mmap write
+                    # failures there raise exceptions (never SIGBUS)
+                    want_mm = True
+                else:
+                    want_mm = blocks * 512 >= st.st_size * 99 // 100
             except OSError:
                 want_mm = False
-        if want_mm and not read_only and not nocache:
+        if want_mm and not read_only:
             # opt-in memory-mapped I/O: page-fault writes + kernel
             # writeback batching beat per-call seek+write syscalls for
             # small scattered writes (measured 4x on cold allocated
@@ -79,12 +84,6 @@ class ImageFileBlkDev(BlockDevice):
                     self._mm = _mmap.mmap(self.fh.fileno(), fsize)
                 except (ValueError, OSError):
                     self._mm = None
-        if nocache:
-            # bypass the OS page cache (macOS F_NOCACHE): used by the
-            # benchmark suite to measure true device-regime performance
-            import fcntl
-            if hasattr(fcntl, "F_NOCACHE"):
-                fcntl.fcntl(self.fh.fileno(), fcntl.F_NOCACHE, 1)
         self.fh.seek(0, os.SEEK_END)
         self._size = self.fh.tell()
         self.num_blocks = self._size // block_bytes
@@ -107,31 +106,39 @@ class ImageFileBlkDev(BlockDevice):
         return self.fh.readinto(out)
 
     def pread(self, lba, nbytes):
-        """Positional read returning fresh bytes: thread-safe (own fd,
-        no shared seek), any byte length. Callers must flush writes
-        first if coherence matters."""
-        import os as _os
-        self._ensure_raw_rfd()
-        return _os.pread(self._raw_rfd, nbytes, lba * self.block_bytes)
+        """Positional read returning fresh bytes: thread-safe. POSIX
+        uses pread on a private fd; the portable fallback (Windows)
+        serializes on a lock."""
+        if hasattr(os, "pread"):
+            self._ensure_raw_rfd()
+            return os.pread(self._raw_rfd, nbytes, lba * self.block_bytes)
+        with self._io_lock():
+            self.fh.seek(lba * self.block_bytes)
+            return self.fh.read(nbytes)
+
+    def _io_lock(self):
+        lock = getattr(self, "_fh_lock", None)
+        if lock is None:
+            import threading
+            lock = self._fh_lock = threading.Lock()
+        return lock
 
     def _ensure_raw_rfd(self):
         import os as _os
         if getattr(self, "_raw_rfd", None) is None:
             self._raw_rfd = _os.open(self.path, _os.O_RDONLY)
-            try:
-                import fcntl as _fcntl
-                if getattr(self, "_nocache", False) and hasattr(_fcntl, "F_NOCACHE"):
-                    _fcntl.fcntl(self._raw_rfd, _fcntl.F_NOCACHE, 1)
-            except ImportError:
-                pass
+
 
     def pread_into(self, lba, out):
-        """Positional read into a buffer: thread-safe (no shared seek),
-        used by parallel read assembly. Coherent with buffered writes
-        because callers flush first."""
-        import os as _os
-        self._ensure_raw_rfd()
-        return _os.preadv(self._raw_rfd, [out], lba * self.block_bytes)
+        """Positional read into a buffer: thread-safe, used by parallel
+        read assembly. POSIX uses preadv on a private fd; the portable
+        fallback (Windows) serializes on a lock -- correct, sequential."""
+        if hasattr(os, "preadv"):
+            self._ensure_raw_rfd()
+            return os.preadv(self._raw_rfd, [out], lba * self.block_bytes)
+        with self._io_lock():
+            self.fh.seek(lba * self.block_bytes)
+            return self.fh.readinto(out)
 
     def write(self, lba, data):
         if self.read_only:
