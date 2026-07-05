@@ -126,6 +126,23 @@ To break through the performance ceiling, we had to hunt down and fix four major
 **The Approach:** Nothing in the FFS format strictly requires block-by-block I/O. Because the allocator scans forward, a fresh file's blocks are almost always physically consecutive on the disk.
 **The Solution:** We upgraded the engine to treat these consecutive runs as a single unit of I/O, grouping allocations into massive 4 MB transfers.
 **The Gain:** The 415,000 syscalls for a 200 MB file plummeted to just **~50 syscalls**.
+### 5. Console Progress Bar Flooding
+**The Case:** When running bulk copies via the CLI, the transfer speed was significantly slower than running programmatic copies in test scripts, pinning the CPU at 100% with the NVMe drive mostly idle.
+**The Problem:** The progress printer was drawing updates to `stdout` for every single file processed. With 239,350 files in the archive, flooding the terminal with hundreds of thousands of stdout writes created a massive blocking I/O bottleneck.
+**The Solution:** We throttled progress updates to fire at most once every 100ms or when the percentage integer incremented, reducing stdout writes to a negligible rate.
+**The Gain:** CLI copy time plummeted from over 2 minutes to **57.21 seconds**.
+
+### 6. Tar Generator Iteration Overhead (Binary Streams)
+**The Case:** Profiling of bulk copies revealed that reading files from the incoming tar archive was spending over 13.5 seconds inside `tar.py`.
+**The Problem:** The archive streaming route was consuming file data via a generic generator yielding 512-byte slices. This generic generator loop incurred millions of yield/generator-iteration function calls in Python.
+**The Solution:** We introduced a fast binary stream path. If the source file size is known, the stream consumes the payload in large chunks directly via `data.read(chunk_size)` instead of iterating, bypassing generator/iteration overhead.
+**The Gain:** Time spent in the archive extraction/read route dropped from **13.5 seconds** to **5.7 seconds**.
+
+### 7. Redundant Directory Walks (1-Element Cache)
+**The Case:** Profiling showed parent directory path walks and `makedirs` calls consuming over **29 seconds** of cumulative CPU time, even with FFS's block-number cache active.
+**The Problem:** For every file, `makedirs` and `_resolve_parent` were performing O(depth) path splits, cache lookups, directory block reads, and `Entry.parse` calls starting from the root of the volume.
+**The Solution:** Since tar files naturally group files under the same parent folder, consecutive writes almost always target the same directory. We implemented a fast, 1-element cache at the volume level (`makedirs` path cache, and parent path-to-Entry cache). If a path matches the previous file, it returns the pre-parsed `Entry` object instantly in 50ns, bypassing the entire resolution chain.
+**The Gain:** Cumulative FFS copy time dropped from **47.89 seconds** to **39.70 seconds** (a 17% speedup), and total python function calls were cut by **60%** (14.2 million down to 5.7 million).
 
 ---
 
