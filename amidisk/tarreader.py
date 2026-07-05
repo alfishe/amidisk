@@ -163,6 +163,8 @@ class LibarchiveTarReader:
         la.archive_entry_size.restype = ctypes.c_longlong
         la.archive_entry_filetype.argtypes = [ctypes.c_void_p]
         la.archive_entry_filetype.restype = ctypes.c_uint
+        la.archive_entry_mtime.argtypes = [ctypes.c_void_p]
+        la.archive_entry_mtime.restype = ctypes.c_longlong
         la.archive_entry_hardlink.argtypes = [ctypes.c_void_p]
         la.archive_entry_hardlink.restype = ctypes.c_char_p
         la.archive_entry_symlink.argtypes = [ctypes.c_void_p]
@@ -240,7 +242,7 @@ class LibarchiveTarReader:
             if n == 0:
                 break
             self._remaining -= n
-            yield buf.raw[:n]
+            yield buf[:n]  # ctypes slice copies n bytes; .raw copies ALL
 
     def close(self):
         if self._a is not None:

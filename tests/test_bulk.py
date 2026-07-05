@@ -101,24 +101,26 @@ class TestBulk(unittest.TestCase):
             pass  # flush against a closed device: the simulated crash
         return p
 
-    def test_ffs_crash_pagecached_detectable_and_repairable(self):
-        """Page-cached bulk: metadata lands per-file, bitmap is stale.
-        Crash must be detected by check and fixed by repair with no
-        file loss."""
+    def test_ffs_crash_pagecached_rolls_back_consistently(self):
+        """Page-cached bulk: dir links and bitmap are deferred in RAM, so
+        a crash leaves written-but-unlinked headers as plain free space.
+        The volume must be consistent, marked not-validated, and repair
+        must revalidate it."""
         p = self._crash_mid_bulk(nocache=False)
         dev = ImageFileBlkDev(p, read_only=False)
         vol2 = FFSVolume(dev, dos_type=0x444F5303).open()
         root = vol2.read_buf(vol2.root_blk)
         self.assertEqual(root.slong(-50), 0, "bm_flag should be invalid")
-        rep = vol2.check()
-        self.assertFalse(rep["ok"], "check must flag the stale bitmap")
+        rep = vol2.check(deep=True)
+        self.assertTrue(rep["ok"], rep["errors"][:4])
+        self.assertTrue(any("not validated" in w for w in rep["warnings"]),
+                        rep["warnings"])
+        self.assertEqual(rep["files"], 0)  # nothing was ever linked
         fix = vol2.repair(apply=True)
         self.assertTrue(fix["applied"])
         rep = vol2.check(deep=True)
         self.assertTrue(rep["ok"], rep["errors"][:4])
-        self.assertEqual(rep["files"], 50)  # nothing lost, all repaired
-        for i in (0, 25, 49):
-            self.assertEqual(len(vol2.read_file_bytes("f%d" % i)), 2000)
+        self.assertFalse(rep["warnings"], rep["warnings"])
         dev.close()
 
     def test_ffs_crash_nocache_rolls_back_atomically(self):

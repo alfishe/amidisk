@@ -502,6 +502,11 @@ class FFSVolume:
 
     # -- raw block I/O -------------------------------------------------
     def read_buf(self, blk):
+        dirty = getattr(self, "_dirty_dirs", None)
+        if dirty is not None:
+            buf = dirty.get(blk)
+            if buf is not None:
+                return buf
         if blk < 1 or blk >= self.total:
             raise FSError("block %d out of volume range" % blk)
         return BlockBuf(self.dev.read(blk * self.spb, self.spb), self.bs)
@@ -628,8 +633,8 @@ class FFSVolume:
         if names is None:
             names = set()
             bs = self.bs
-            for h in range(self.tsz):
-                blk = dir_buf.long(6 + h)
+            heads = struct.unpack_from(">%dI" % self.tsz, dir_buf.data, 24)
+            for blk in heads:
                 guard = 0
                 while blk:
                     guard += 1
@@ -930,6 +935,7 @@ class FFSVolume:
                 root.put_slong(-50, 0)  # bm_flag: bitmap not valid
                 root.fix_checksum()
                 self.write_buf(self.root_blk, root)
+                self._dirty_dirs = {}
                 from ..blkdev import BulkWriteCache
                 if (not isinstance(self.dev, BulkWriteCache)
                         and getattr(self.dev, "_nocache", False)):
@@ -942,6 +948,8 @@ class FFSVolume:
             finally:
                 self._bulk_depth -= 1
                 if self._bulk_depth == 0:
+                    self._flush_dirty_dirs()
+                    self._dirty_dirs = None
                     self.bitmap.flush()
                     root = self.read_buf(self.root_blk)
                     root.put_slong(-50, -1)  # bitmap valid again
@@ -962,6 +970,7 @@ class FFSVolume:
         if getattr(self, "_bulk_depth", 0):
             self._bulk_ops += 1
             if self._bulk_ops % self._bulk_every == 0:
+                self._flush_dirty_dirs()
                 self.bitmap.flush()
             return
         self.bitmap.flush()
@@ -1048,24 +1057,45 @@ class FFSVolume:
             raise FSError("parent is not a directory")
         return parent, name
 
-    def _link_entry(self, dir_blk, new_blk, name):
+    def _link_entry(self, dir_blk, new_blk, name, new_buf=None):
         """Insert block at the head of the dir's hash chain, as the ROM
         FastFileSystem does (the format imposes no chain ordering, and a
-        head insert is O(1) instead of a full chain walk)."""
+        head insert is O(1) instead of a full chain walk).
+
+        With new_buf (the not-yet-written header) the chain pointer is
+        preset and the header written exactly once -- no read-modify-
+        rewrite. In bulk mode the dir block stays dirty in RAM and is
+        flushed at batch points: ~one dir write per N files, not per
+        file."""
         h = hash_name(name, self.tsz, self.intl)
-        dbuf = self.read_buf(dir_blk)
+        dirty = getattr(self, "_dirty_dirs", None)
+        dbuf = dirty.get(dir_blk) if dirty is not None else None
+        if dbuf is None:
+            dbuf = self.read_buf(dir_blk)
         head = dbuf.long(6 + h)
-        nbuf = self.read_buf(new_blk)
+        nbuf = new_buf if new_buf is not None else self.read_buf(new_blk)
         nbuf.put_long(-4, head)
         nbuf.fix_checksum()
         self.write_buf(new_blk, nbuf)
         dbuf.put_long(6 + h, new_blk)
         self._now_stamp(dbuf, self._date_loc(dir_blk))
-        dbuf.fix_checksum()
-        self.write_buf(dir_blk, dbuf)
+        if dirty is not None:
+            dirty[dir_blk] = dbuf  # checksum + write deferred to flush
+        else:
+            dbuf.fix_checksum()
+            self.write_buf(dir_blk, dbuf)
         c = getattr(self, "_dir_names_cache", None)
         if c is not None and dir_blk in c:
             c[dir_blk].add(self._fold(bytes(name)))
+
+    def _flush_dirty_dirs(self):
+        dirty = getattr(self, "_dirty_dirs", None)
+        if not dirty:
+            return
+        for blk, dbuf in dirty.items():
+            dbuf.fix_checksum()
+            self.write_buf(blk, dbuf)
+        dirty.clear()
 
     def _unlink_entry(self, entry):
         c = getattr(self, "_dir_names_cache", None)
@@ -1481,9 +1511,8 @@ class FFSVolume:
                 buf.data[lo : 24 + self.tsz * 4] = table_bytes(0, head_n)
             buf.put_long(-47, size)
             buf.put_long(-2, next_ext_ptr)
-            buf.fix_checksum()
-            self.write_buf(hdr_blk, buf)
-            
+            # written once by _link_entry with the chain pointer preset
+
         except Exception:
             if blocks is not None:
                 self.bitmap.free(blocks)
@@ -1495,7 +1524,7 @@ class FFSVolume:
             self.bitmap.flush()
             raise
 
-        self._link_entry(parent.blk, hdr_blk, name)
+        self._link_entry(parent.blk, hdr_blk, name, new_buf=buf)
         self._update_dircache(parent.blk)
         self._commit_meta()
         return hdr_blk

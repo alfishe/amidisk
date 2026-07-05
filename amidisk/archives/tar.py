@@ -33,53 +33,43 @@ class TarHandler(ArchiveHandler):
         total_archive_size = os.path.getsize(self.path)
         
         try:
-            with tarfile.open(self.path, "r") as tar:
+            from ..tarreader import open_tar
+            with open_tar(self.path) as tar:
                 for member in tar:
                     name = member.name
                     if name.startswith("./"):
                         name = name[2:]
                     elif name == ".":
                         continue
-                        
+
                     if not name:
                         continue
-                        
+
                     parts = [truncate_func(p, max_len) for p in name.split("/")]
                     rel_amiga = "/".join(parts)
-                    
+
                     amiga_dir = base_amiga_path if rel_amiga == "." else (
                         (base_amiga_path + "/" if base_amiga_path else "") + rel_amiga
                     )
-                    
-                    if member.isdir():
+
+                    if member.isdir:
                         if amiga_dir:
                             vol.makedirs(amiga_dir)
                             dir_count += 1
-                    elif member.isfile():
+                    elif member.isfile:
                         parent_dir = "/".join(amiga_dir.split("/")[:-1])
                         if parent_dir:
                             vol.makedirs(parent_dir)
-                            
-                        fh = tar.extractfile(member)
-                        if fh is not None:
-                            mtime = datetime.fromtimestamp(member.mtime)
-                            vol.write_file(
-                                amiga_dir, fh, size=member.size, 
-                                protect=protect, comment=comment, mtime=mtime
-                            )
-                            n += 1
-                            total_bytes += member.size
-                    # Update progress: percentage from archive position,
-                    # but display actual content bytes to match final stats
-                    if tar.fileobj:
-                        pos = tar.fileobj.tell()
-                        # Estimate total content from current ratio
-                        if pos > 0:
-                            est_total = int(total_bytes * total_archive_size / pos)
-                        else:
-                            est_total = total_archive_size
-                        print_progress(total_bytes, est_total, parts[-1])
-                        
+
+                        mtime = datetime.fromtimestamp(member.mtime or 0)
+                        vol.write_file(
+                            amiga_dir, member.chunks(), size=member.size,
+                            protect=protect, comment=comment, mtime=mtime
+                        )
+                        n += 1
+                        total_bytes += member.size
+                    # progress: content bytes against total archive size
+                    print_progress(total_bytes, total_archive_size, parts[-1])
         except Exception as e:
             print("") # newline to lock progress bar before error message
             print("error: streaming interrupted: %s" % e, file=sys.stderr)
