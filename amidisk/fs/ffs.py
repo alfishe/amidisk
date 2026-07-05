@@ -227,7 +227,9 @@ class Bitmap:
             if guard > MAX_CHAIN:
                 raise FSError("cyclic bitmap extension chain")
             ebuf = vol.read_buf(ext)
-            for i in range(1, vol.nl - 1):
+            # bmext blocks have NO checksum: longs 0..nl-2 are ALL page
+            # pointers (real AmigaOS images; ADF spec; amitools agrees)
+            for i in range(vol.nl - 1):
                 p = ebuf.long(i)
                 if p:
                     ptrs.append(p)
@@ -1682,12 +1684,14 @@ class FFSVolume:
         idx = 25
         for x, eblk in enumerate(ext_blks):
             ebuf = BlockBuf(None, self.bs)
-            for i in range(1, self.nl - 1):
+            # bmext layout: longs 0..nl-2 = page pointers, last = next.
+            # No checksum -- long 0 is a POINTER (writing a checksum
+            # there makes real handlers read it as a bogus page).
+            for i in range(self.nl - 1):
                 if idx < npages:
                     ebuf.put_long(i, page_blks[idx])
                     idx += 1
             ebuf.put_long(self.nl - 1, ext_blks[x + 1] if x + 1 < next_blocks else 0)
-            ebuf.fix_checksum(0)
             self.dev.write(eblk * self.spb, bytes(ebuf.data))
 
         # root block
