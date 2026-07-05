@@ -306,10 +306,11 @@ def _safe_name(name):
 def cmd_extract(args):
     img_path, vol_name = _parse_image_arg(args.image)
     with open_image(img_path) as img:
-        vol_ref, path = img.parse_path(_combine_path(vol_name, args.path))
+        # the image argument already carries "Volume/path"
+        vol_ref, path = img.parse_path(_combine_path(vol_name, ""))
         vol = vol_ref.mount()
         entry = vol.resolve(path)
-        dest = args.dest
+        dest = args.dest or "." 
         if entry.is_file():
             if os.path.isdir(dest):
                 dest = os.path.join(dest, _safe_name(entry.name_str()))
@@ -628,10 +629,14 @@ def cmd_rm(args):
 
 
 def cmd_mv(args):
-    img_path, vol_name = _parse_image_arg(args.image)
+    img_path, vn_src = _parse_image_arg(args.src)
+    img_path2, vn_dst = _parse_image_arg(args.dst)
+    if img_path2 != img_path:
+        print("error: mv works within one image", file=sys.stderr)
+        return 1
     with open_image(img_path, writable=True) as img:
-        vol_ref, src = img.parse_path(_combine_path(vol_name, args.src))
-        vol_ref2, dst = img.parse_path(_combine_path(vol_name, args.dst))
+        vol_ref, src = img.parse_path(_combine_path(vn_src, ""))
+        vol_ref2, dst = img.parse_path(_combine_path(vn_dst, ""))
         if vol_ref is not vol_ref2:
             print("error: mv works within one volume", file=sys.stderr)
             return 1

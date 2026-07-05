@@ -259,6 +259,60 @@ Python list (409 600 ints for a 200 MB file, ~0.045 s). A runs-based
 allocator (`alloc_runs`, already present) wired through `write_file`
 is expected to put 512-byte FFS at 2.3–2.6 GB/s.
 
+## The import pipeline: 614 to 11,900 files per second
+
+Bulk import (tar archive -> Amiga volume) is the workload the use-case
+table calls the one that hurts when slow. Its history, measured on the
+same 239,350-file / 6.29 GB WHDLoad library throughout:
+
+| stage | time | files/s | what changed |
+|---|---|---|---|
+| first working import | ~390 s | 614 | correct but naive |
+| directory-resolution caches, head insertion | 55.8 s | 4,288 | stop re-resolving parents per file |
+| bulk mode + engine write work | 50.3 s | 4,755 | deferred metadata commits |
+| libarchive reader | 38.6 s | 6,205 | tar parsing 10 s -> 1.7 s |
+| per-file overhead round (below) | **20.1 s** | **11,888** | engine loop, 4 K LNFS |
+| native APFS `tar -x`, same tar | 50.7 s | ~4,720 | the kernel-filesystem reference |
+
+The final round attacked per-file fixed costs, found by profiling the
+real 4 K LNFS target:
+
+- **A 1 MB copy hiding in a slice.** The libarchive reader's
+  `buf.raw[:n]` materializes the entire ctypes buffer before slicing:
+  ~25 GB of memcpy per import for 2 KB median files. `buf[:n]` copies
+  n bytes. The cheapest-looking line was the most expensive.
+- **968 tiny reads of one table.** The directory name cache read hash
+  table heads one longword accessor at a time; one struct unpack reads
+  the whole table.
+- **Headers written twice.** Every file header was written, re-read,
+  hash-chain-linked, re-checksummed and rewritten. The chain head is
+  known before the first write -- headers now go to disk exactly once.
+- **Directory blocks rewritten per file.** In bulk mode directory
+  blocks stay dirty in RAM and flush at batch points: one 4 K write and
+  checksum per ~19 files instead of per file. Side effect: a crash
+  mid-bulk now rolls back cleanly (headers without links are just free
+  space), which strengthened the crash contract rather than weakening
+  it.
+- **`makedirs` per file in the CLI.** The archive streamer resolved
+  the parent directory path for every file; a seen-set reduced 239 k
+  resolutions to 12.6 k. This one lived in the CLI layer, invisible to
+  engine benchmarks -- end-to-end timing is the only test that catches
+  every layer.
+
+Two tar readers exist behind one interface (`amidisk/tarreader.py`):
+pure-Python `tarfile` and a ctypes binding to the system libarchive,
+auto-selected with fallback, proven byte-identical on the full library
+(every name, kind, size and MD5). One integration trap worth its own
+sentence: libarchive silently merges AppleDouble `._*` members into
+the preceding entry unless the option is spelled exactly `!mac-ext` --
+the plausible `mac-ext=0` parses and does nothing, and 806 files
+vanish.
+
+End-to-end CLI (`cp --bulk` of the library onto a 4 K LNFS RDB
+partition): 37 s -> 25 s, deep-check clean. For calibration: the same
+content extracted by macOS onto APFS takes 51 s to write and 178 s to
+read back; this engine now does 20/40 s.
+
 ### Costs and trade-offs
 
 None of the optimizations changed the on-disk result: the same blocks

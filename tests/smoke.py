@@ -269,15 +269,15 @@ def test_cli(tmp):
 
     def t():
         run("create", adf, "--adf", "--format", "CliVol", "--dostype", "ffs-intl")
-        run("mkdir", adf, "Dir")
+        run("mkdir", adf + ":DF0/Dir")
         run("put", adf, payload, "Dir/p.bin")
-        out = run("ls", adf, "Dir")
+        out = run("ls", adf + ":DF0/Dir")
         assert "p.bin" in out
         back = os.path.join(tmp, "back.bin")
-        run("extract", adf, "Dir/p.bin", back)
+        run("extract", adf + ":DF0/Dir/p.bin", back)
         assert open(back, "rb").read() == open(payload, "rb").read()
-        run("mv", adf, "Dir/p.bin", "renamed.bin")
-        run("rm", adf, "Dir")
+        run("mv", adf + ":DF0/Dir/p.bin", adf + ":DF0/renamed.bin")
+        run("rm", adf + ":DF0/Dir")
         out = run("check", adf)
         assert "OK" in out
 
@@ -307,11 +307,11 @@ def test_streaming(tmp):
         run("create", dst_hdf, "--format", "Dst", "--dostype", "ffs-intl", "--size", "1M")
         
         run("put", src_hdf, payload, "file.bin")
-        out = run("cp", src_hdf, "file.bin", dst_hdf, "copied.bin", "--checksum")
+        out = run("cp", src_hdf + ":DH0/file.bin", dst_hdf + ":DH0/copied.bin", "--checksum")
         assert "md5:" in out
         
         out_file = os.path.join(tmp, "verify.bin")
-        run("extract", dst_hdf, "copied.bin", out_file)
+        run("extract", dst_hdf + ":DH0/copied.bin", out_file)
         
         assert open(out_file, "rb").read() == open(payload, "rb").read()
 
@@ -324,12 +324,12 @@ def test_streaming(tmp):
             run("create", dst_hdf, "--format", "Dst", "--dostype", "ffs", "--size", "1M", "--force")
             
             sfs_file = "Prefs/Env-Archive/deficons.prefs"
-            run("cp", sfs_real, sfs_file, dst_hdf, "streamed.prefs", "--checksum")
+            run("cp", sfs_real + ":SDH0/" + sfs_file, dst_hdf + ":DH0/streamed.prefs", "--checksum")
             
             # verify
             out_file = os.path.join(tmp, "verify_sfs.bin")
-            run("extract", dst_hdf, "streamed.prefs", out_file)
-            run("extract", sfs_real, sfs_file, os.path.join(tmp, "sfs_orig.bin"))
+            run("extract", dst_hdf + ":DH0/streamed.prefs", out_file)
+            run("extract", sfs_real + ":SDH0/" + sfs_file, os.path.join(tmp, "sfs_orig.bin"))
             assert open(out_file, "rb").read() == open(os.path.join(tmp, "sfs_orig.bin"), "rb").read()
             
         check("stream copy from SFS image", t_sfs_stream)

@@ -31,6 +31,15 @@ class TarHandler(ArchiveHandler):
         dir_count = 0
         total_bytes = 0
         total_archive_size = os.path.getsize(self.path)
+        made = set()  # dirs already created: avoids a full path
+                      # resolution per FILE (239k makedirs -> 12k)
+
+        def ensure_dir(p):
+            if p and p not in made:
+                vol.makedirs(p)
+                parts = p.split("/")
+                for i in range(1, len(parts) + 1):
+                    made.add("/".join(parts[:i]))
         
         try:
             from ..tarreader import open_tar
@@ -54,12 +63,11 @@ class TarHandler(ArchiveHandler):
 
                     if member.isdir:
                         if amiga_dir:
-                            vol.makedirs(amiga_dir)
+                            ensure_dir(amiga_dir)
                             dir_count += 1
                     elif member.isfile:
                         parent_dir = "/".join(amiga_dir.split("/")[:-1])
-                        if parent_dir:
-                            vol.makedirs(parent_dir)
+                        ensure_dir(parent_dir)
 
                         mtime = datetime.fromtimestamp(member.mtime or 0)
                         vol.write_file(
