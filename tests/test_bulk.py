@@ -10,6 +10,8 @@ import sys
 import tempfile
 import unittest
 
+SCRATCH_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scratch")
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -28,7 +30,8 @@ ENGINES = [
 
 class TestBulk(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="amidisk-bulk-")
+        self.tmp = os.path.join(SCRATCH_BASE, self.__class__.__name__)
+        os.makedirs(self.tmp, exist_ok=True)
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
     def fresh(self, cls, dt, name):

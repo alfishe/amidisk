@@ -3,10 +3,14 @@
 Skipped when the hst.imager binary is unavailable (set HST_IMAGER to point
 at it). These are the strongest correctness signals we have short of
 mounting under the real pfs3aio handler in an emulator.
+
+Note: hst.imager on Windows misinterprets forward slashes in image paths
+like "img.hdf/rdb/dh0", so these tests run only on Unix.
 """
 
 import os
 import subprocess
+import sys
 import unittest
 
 from .util import TempDirTest, hst_imager, HST_HDF
@@ -21,6 +25,7 @@ def _hst(*args):
     return r.stdout
 
 
+@unittest.skipIf(sys.platform == "win32", "hst.imager path syntax broken on Windows")
 @unittest.skipUnless(hst_imager(), "hst.imager binary not available")
 class TestInterop(TempDirTest):
     def make_rdb_pfs3(self, name="ip.hdf", size="48M", label="Interop"):

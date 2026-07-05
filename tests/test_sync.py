@@ -2,6 +2,8 @@ import os
 import shutil
 import sys
 import unittest
+
+SCRATCH_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scratch")
 import tempfile
 import subprocess
 from datetime import datetime
@@ -16,7 +18,8 @@ from amidisk.fs.ffs import FFSVolume
 
 class TestSyncTool(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="amidisk-test-sync-")
+        self.tmp = os.path.join(SCRATCH_BASE, self.__class__.__name__)
+        os.makedirs(self.tmp, exist_ok=True)
         self.addCleanup(shutil.rmtree, self.tmp, True)
         
     def fresh_volume(self, name):

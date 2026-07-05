@@ -13,6 +13,8 @@ import sys
 import tempfile
 import unittest
 
+SCRATCH_BASE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scratch")
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -22,12 +24,13 @@ from amidisk.blkdev import ImageFileBlkDev         # noqa: E402
 from amidisk.fs.ffs import FSError                 # noqa: E402
 from amidisk.fs.sfs import SFSVolume, _sfs_hash    # noqa: E402
 
-REAL_HDF = os.path.join(ROOT, "data", "test", "sfs-real.hdf")
+REAL_HDF = os.path.join(ROOT, "tests", "data", "sfs-real.hdf")
 
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="amidisk-sfs-")
+        self.tmp = os.path.join(SCRATCH_BASE, self.__class__.__name__)
+        os.makedirs(self.tmp, exist_ok=True)
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
     def tpath(self, n):
@@ -137,6 +140,8 @@ class TestRealFixture(Base):
         self.assert_clean(vol)
 
     def test_untouched_files_stable(self):
+        if not os.path.exists(REAL_HDF):
+            self.skipTest("sfs-real.hdf missing")
         with open_image(REAL_HDF) as img:
             keep = img.volumes[0].mount().read_file_bytes(
                 "Prefs/Env-Archive/Sys/screenmode.prefs")

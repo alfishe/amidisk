@@ -9,6 +9,8 @@ import sys
 import tempfile
 import unittest
 
+SCRATCH_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scratch")
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -39,7 +41,8 @@ MATRIX = [
 
 class TestSupportedMatrix(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="amidisk-matrix-")
+        self.tmp = os.path.join(SCRATCH_BASE, self.__class__.__name__)
+        os.makedirs(self.tmp, exist_ok=True)
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
     def test_format_write_read_all(self):
@@ -90,7 +93,8 @@ class TestSupportedMatrix(unittest.TestCase):
 
 class TestUnknownIdentification(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="amidisk-ident-")
+        self.tmp = os.path.join(SCRATCH_BASE, self.__class__.__name__)
+        os.makedirs(self.tmp, exist_ok=True)
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
     def dev_with_block0(self, block0, size_mb=2):

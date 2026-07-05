@@ -23,17 +23,36 @@ class ArchiveHandler:
         raise NotImplementedError()
 
 
+import sys
+
 def find_executable(names):
-    """Finds an executable in PATH or common search paths."""
+    """Finds an executable in PATH, tests/tools/<platform>, or common search paths."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    tools_dir = os.path.join(root, "tests", "tools", sys.platform)
+    is_win = sys.platform == "win32"
+    # expand names to include .exe variants on Windows
+    expanded = []
     for name in names:
+        expanded.append(name)
+        if is_win and not name.endswith(".exe"):
+            expanded.append(name + ".exe")
+    # check PATH first
+    for name in expanded:
         path = shutil.which(name)
         if path:
             return path
-    for name in names:
-        for loc in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]:
-            path = os.path.join(loc, name)
-            if os.path.isfile(path) and os.access(path, os.X_OK):
-                return path
+    # check tests/tools/<platform>
+    for name in expanded:
+        cand = os.path.join(tools_dir, name)
+        if os.path.isfile(cand) and (is_win or os.access(cand, os.X_OK)):
+            return cand
+    # common Unix paths
+    if not is_win:
+        for name in names:
+            for loc in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]:
+                path = os.path.join(loc, name)
+                if os.path.isfile(path) and os.access(path, os.X_OK):
+                    return path
     return None
 
 

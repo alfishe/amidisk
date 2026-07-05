@@ -26,7 +26,9 @@ from amidisk.fs.sfs import SFSVolume
 from amidisk.rdb import RDisk                       # noqa: E402
 
 DATA = os.path.join(ROOT, "data")
-TESTDATA = os.path.join(DATA, "test")
+TESTDATA = os.path.join(ROOT, "tests", "data")
+
+SCRATCH_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scratch")
 
 PASS = FAIL = SKIP = 0
 
@@ -360,7 +362,8 @@ def test_sfs_format(tmp):
 
 
 def main():
-    tmp = tempfile.mkdtemp(prefix="amidisk-test-")
+    tmp = os.path.join(SCRATCH_BASE, "smoke")
+    os.makedirs(tmp, exist_ok=True)
     try:
         test_user_images()
         test_fixture_images()

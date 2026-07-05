@@ -14,6 +14,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+
+SCRATCH_BASE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scratch")
 from datetime import datetime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -25,15 +27,22 @@ from amidisk.fs.ffs import FFSVolume, FSError   # noqa: E402
 
 
 def xdftool():
-    cand = os.path.join(
-        os.path.expanduser("~"), ".local", "bin", "xdftool"
-    )
-    return cand if os.access(cand, os.X_OK) else None
+    # check tests/tools/<platform> first, then PATH, then ~/.local/bin
+    plat = sys.platform
+    for cand in (
+        os.path.join(ROOT, "tests", "tools", plat, "xdftool"),
+        shutil.which("xdftool"),
+        os.path.join(os.path.expanduser("~"), ".local", "bin", "xdftool"),
+    ):
+        if cand and os.access(cand, os.X_OK):
+            return cand
+    return None
 
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="amidisk-lnfs-")
+        self.tmp = os.path.join(SCRATCH_BASE, self.__class__.__name__)
+        os.makedirs(self.tmp, exist_ok=True)
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
     def vol(self, flavor, mb=8):

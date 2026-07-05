@@ -8,6 +8,8 @@ import sys
 import tempfile
 import unittest
 
+SCRATCH_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scratch")
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -22,7 +24,8 @@ PFS3AIO = os.path.join(DRIVERS, "pfs3aio")
 @unittest.skipUnless(os.path.exists(PFS3AIO), "driver collection missing")
 class TestFsAdd(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="amidisk-fsadd-")
+        self.tmp = os.path.join(SCRATCH_BASE, self.__class__.__name__)
+        os.makedirs(self.tmp, exist_ok=True)
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.img = os.path.join(self.tmp, "t.hdf")
         with open(self.img, "wb") as fh:

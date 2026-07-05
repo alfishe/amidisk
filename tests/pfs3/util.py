@@ -6,11 +6,13 @@ import sys
 import tempfile
 import unittest
 
+SCRATCH_BASE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scratch")
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-TESTDATA = os.path.join(ROOT, "data", "test")
+TESTDATA = os.path.join(ROOT, "tests", "data")
 REAL_HDF = os.path.join(TESTDATA, "pfs3-real.hdf")   # written by real pfs3aio
 HST_HDF = os.path.join(TESTDATA, "pfs3-hst.hdf")     # written by hst-imager
 
@@ -19,21 +21,39 @@ PFS3_DOSTYPE = 0x50465303
 
 def hst_imager():
     """Path to the hst-imager binary, or None (interop tests skip)."""
+    import shutil
+    import subprocess
     cand = os.environ.get("HST_IMAGER")
     if cand and os.access(cand, os.X_OK):
         return cand
-    for base in (
-        "/private/tmp/claude-501/-Volumes-TB4-4Tb-Projects-Amiga-software-AmigaFSTool"
-        "/d433e96e-18d1-482c-9589-3c0f0571949b/scratchpad/hst/hst.imager",
-    ):
-        if os.access(base, os.X_OK):
-            return base
+    is_win = sys.platform == "win32"
+    names = ["hst.imager", "hst-imager"]
+    if is_win:
+        names = [n + ".exe" for n in names] + names
+    # check tests/tools/<platform>
+    tools_dir = os.path.join(ROOT, "tests", "tools", sys.platform)
+    for name in names:
+        cand = os.path.join(tools_dir, name)
+        if os.path.isfile(cand) and (is_win or os.access(cand, os.X_OK)):
+            # verify it actually runs (x64 binary on arm64 via rosetta may fail)
+            try:
+                r = subprocess.run([cand, "--version"], capture_output=True, timeout=5)
+                if r.returncode == 0:
+                    return cand
+            except Exception:
+                pass
+    # check PATH
+    for name in names:
+        cand = shutil.which(name)
+        if cand:
+            return cand
     return None
 
 
 class TempDirTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="amidisk-pfs3-")
+        self.tmp = os.path.join(SCRATCH_BASE, self.__class__.__name__)
+        os.makedirs(self.tmp, exist_ok=True)
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
     def tpath(self, name):
@@ -46,11 +66,16 @@ class TempDirTest(unittest.TestCase):
         shutil.copy(src, dst)
         return dst
 
-    def blank_volume(self, size_mb=16, name="blank.hdf"):
+    def blank_volume(self, size_mb=16, name=None):
         """Blank bare image + writable PFS3Volume (not formatted yet)."""
         from amidisk.blkdev import ImageFileBlkDev
         from amidisk.fs.pfs3 import PFS3Volume
 
+        if name is None:
+            # unique name per call avoids Windows handle conflicts in loops
+            n = getattr(self, "_blank_counter", 0)
+            self._blank_counter = n + 1
+            name = "blank%d.hdf" % n
         path = self.tpath(name)
         with open(path, "wb") as fh:
             fh.truncate(size_mb * 1024 * 1024)

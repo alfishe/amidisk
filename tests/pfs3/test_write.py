@@ -147,6 +147,8 @@ class TestMutationsOnRealFixture(TempDirTest):
         self.assertTrue(rep["ok"], rep["errors"][:3])
 
     def test_untouched_files_unchanged(self):
+        if not os.path.exists(REAL_HDF):
+            self.skipTest("pfs3-real.hdf missing")
         with open_image(REAL_HDF) as img:
             pristine = img.volumes[0].mount().read_file_bytes(
                 "MMULib/MuTools/MuForce.guide"

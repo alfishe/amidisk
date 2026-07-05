@@ -2,6 +2,8 @@ import os
 import shutil
 import sys
 import unittest
+
+SCRATCH_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scratch")
 import tempfile
 from datetime import datetime
 
@@ -16,12 +18,13 @@ from amidisk.archives.base import find_executable
 from amidisk.blkdev import ImageFileBlkDev
 from amidisk.fs.ffs import FFSVolume
 
-REAL_LHA = os.path.join(ROOT, "pfs3aio.lha")
+REAL_LHA = os.path.join(ROOT, "tests", "data", "pfs3aio.lha")
 REAL_7Z = os.path.join(ROOT, "test.7z")
 
 class TestSubprocessArchives(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="amidisk-test-archives-")
+        self.tmp = os.path.join(SCRATCH_BASE, self.__class__.__name__)
+        os.makedirs(self.tmp, exist_ok=True)
         self.addCleanup(shutil.rmtree, self.tmp, True)
         
     def fresh_volume(self, name):
@@ -72,7 +75,7 @@ class TestSubprocessArchives(unittest.TestCase):
         self.assertTrue(n > 0)
         self.assertTrue(size > 0)
         
-    @unittest.skipUnless(find_executable(["lha", "7z", "7za"]), "LHA extraction tool not found")
+    @unittest.skipUnless(find_executable(["lha"]), "LHA tool not found")
     def test_lha_test_and_stream(self):
         if not os.path.exists(REAL_LHA):
             self.skipTest("pfs3aio.lha fixture not available")

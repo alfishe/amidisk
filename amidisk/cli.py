@@ -72,13 +72,25 @@ def _parse_image_arg(image_arg, vol_arg=None):
     """
     Parses 'path/to/image:Volume' syntax, returning (path, volume).
     Falls back to an explicit volume argument if provided.
+    Windows: skip the drive letter colon (C:\...) when looking for the
+    volume separator.
     """
-    if ":" in image_arg and not os.path.exists(image_arg):
-        path, vol = image_arg.rsplit(":", 1)
+    # find the last colon that isn't a Windows drive letter (X:\ pattern)
+    idx = image_arg.rfind(":")
+    if idx > 0:
+        # skip if this is a drive letter colon
+        if idx == 1 and image_arg[0].isalpha():
+            return image_arg, vol_arg or ""
+        path = image_arg[:idx]
+        vol = image_arg[idx + 1:]
         if os.path.exists(path):
             return path, vol
-        path, vol = image_arg.split(":", 1)
-        return path, vol
+        # first colon after a possible drive letter
+        start = 2 if len(image_arg) > 2 and image_arg[1] == ":" else 0
+        idx2 = image_arg.find(":", start)
+        if idx2 > start:
+            path, vol = image_arg[:idx2], image_arg[idx2 + 1:]
+            return path, vol
     return image_arg, vol_arg or ""
 
 
