@@ -54,6 +54,13 @@ class TarHandler(ArchiveHandler):
                     if not name:
                         continue
 
+                    # Skip macOS AppleDouble files and PaxHeader entries
+                    basename = name.split("/")[-1]
+                    if basename.startswith("._") or "/._" in name:
+                        continue
+                    if "PaxHeader/" in name or "PaxHeader" in basename:
+                        continue
+
                     parts = [truncate_func(p, max_len) for p in name.split("/")]
                     rel_amiga = "/".join(parts)
 
