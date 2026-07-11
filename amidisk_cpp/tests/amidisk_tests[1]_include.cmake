@@ -1,0 +1,5 @@
+if(EXISTS "/Volumes/TB4-4Tb/Projects/Amiga/software/AmigaFSTool/amidisk_cpp/tests/amidisk_tests[1]_tests.cmake")
+  include("/Volumes/TB4-4Tb/Projects/Amiga/software/AmigaFSTool/amidisk_cpp/tests/amidisk_tests[1]_tests.cmake")
+else()
+  add_test(amidisk_tests_NOT_BUILT amidisk_tests_NOT_BUILT)
+endif()
