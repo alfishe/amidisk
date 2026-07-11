@@ -94,10 +94,31 @@ ImageFileBlkDev::ImageFileBlkDev(const std::string& path, bool read_only, uint32
         }
     } else if (strategy_ == IOStrategy::Mmap) {
         // Mmap not yet implemented on Windows; fall back to Win32 positional I/O
+        // Just use the Posix (Win32) code path directly
         strategy_ = IOStrategy::Posix;
-        // Recurse with corrected strategy (will hit the Posix branch above)
-        *this = ImageFileBlkDev(path, read_only, block_bytes, strategy_);
-        return;
+
+        DWORD access = read_only_ ? GENERIC_READ : (GENERIC_READ | GENERIC_WRITE);
+        DWORD creation = read_only_ ? OPEN_EXISTING : OPEN_ALWAYS;
+        DWORD flags = FILE_ATTRIBUTE_NORMAL;
+
+        handle_ = CreateFileA(
+            path_.c_str(),
+            access,
+            FILE_SHARE_READ,
+            nullptr,
+            creation,
+            flags,
+            nullptr
+        );
+
+        if (handle_ == INVALID_HANDLE_VALUE) {
+            throw BlockDeviceError("Failed to open image file: " + path_);
+        }
+
+        LARGE_INTEGER li;
+        if (GetFileSizeEx(handle_, &li)) {
+            size_bytes_ = static_cast<uint64_t>(li.QuadPart);
+        }
     } else
 #endif
 

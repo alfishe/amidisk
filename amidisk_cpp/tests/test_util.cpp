@@ -3,6 +3,11 @@
 #include <chrono>
 #include <ctime>
 
+#ifdef _WIN32
+// Windows doesn't have timegm, use _mkgmtime instead
+#define timegm _mkgmtime
+#endif
+
 using namespace amidisk;
 
 // Test Amiga timestamp conversion
