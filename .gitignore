@@ -177,3 +177,9 @@ $RECYCLE.BIN/
 
 *.tar
 tests/scratch/
+
+# IDE/tool configs
+.qoder/
+
+# Host test data (ROMs, WHDLoad sources, etc.)
+data/host/
