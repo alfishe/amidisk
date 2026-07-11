@@ -1,5 +1,6 @@
 #include "ffs.h"
 #include "util.h"
+#include "../blkdev/bulk_cache.h"
 #include <cstring>
 #include <stdexcept>
 #include <algorithm>
@@ -1216,6 +1217,9 @@ void FFSVolume::format(const std::string& name, uint32_t dos_type_val) {
 }
 void FFSVolume::write_file(const std::string& path, std::span<const uint8_t> data, const WriteParams& params) {
     if (read_only_) throw FSError("device is read-only");
+
+    // Auto-detect bulk mode from device wrapper
+    bulk_mode_ = (dynamic_cast<BulkWriteCache*>(dev.get()) != nullptr);
     auto [parent, name] = resolve_parent(path);
 
     // Check if file exists in parent dir (no full path resolve needed)
@@ -1326,6 +1330,7 @@ void FFSVolume::write_file(const std::string& path, std::span<const uint8_t> dat
     write_buf(hdr_blk, buf);
 
     link_entry(parent.blk, hdr_blk, name);
+    flush_dirty_dirs();
     bitmap->flush();
 }
 
@@ -1407,19 +1412,52 @@ BlockBuf FFSVolume::new_header(uint32_t blk, int32_t sec_type, uint32_t parent_b
 
 void FFSVolume::link_entry(uint32_t dir_blk, uint32_t new_blk, const std::string& name, BlockBuf* new_buf) {
     uint32_t h = amidisk::hash_name(std::vector<uint8_t>(name.begin(), name.end()), tsz, intl);
-    
-    BlockBuf dbuf = read_buf(dir_blk);
+
+    // PERF: In bulk mode, cache dirty directory blocks instead of writing
+    // immediately. For 251K files in 12K dirs, this saves ~239K dir writes.
+    BlockBuf* dbuf_ptr;
+    BlockBuf dbuf_local(bs);
+    auto it = dirty_dirs_.find(dir_blk);
+    if (it != dirty_dirs_.end()) {
+        dbuf_ptr = &it->second;
+    } else {
+        dbuf_local = read_buf(dir_blk);
+        dbuf_ptr = &dbuf_local;
+    }
+    BlockBuf& dbuf = *dbuf_ptr;
+
     uint32_t head = dbuf.long_val(6 + h);
-    
+
     BlockBuf nbuf = new_buf ? *new_buf : read_buf(new_blk);
     nbuf.put_long(-4, head);
     nbuf.fix_checksum();
     write_buf(new_blk, nbuf);
-    
+
     dbuf.put_long(6 + h, new_blk);
-    now_stamp(dbuf, dir_blk == root_blk ? -10 : -12); // root date is at -10, userdir at -12
-    dbuf.fix_checksum();
-    write_buf(dir_blk, dbuf);
+    now_stamp(dbuf, dir_blk == root_blk ? -10 : -12);
+
+    if (bulk_mode_) {
+        // Defer write - store in dirty cache (checksum fixed at flush)
+        dirty_dirs_[dir_blk] = dbuf;
+    } else {
+        dbuf.fix_checksum();
+        write_buf(dir_blk, dbuf);
+    }
+}
+
+void FFSVolume::flush_dirty_dirs() {
+    for (auto& [blk, buf] : dirty_dirs_) {
+        buf.fix_checksum();
+        write_buf(blk, buf);
+    }
+    dirty_dirs_.clear();
+}
+
+void FFSVolume::set_bulk_mode(bool enabled) {
+    if (!enabled && bulk_mode_) {
+        flush_dirty_dirs();
+    }
+    bulk_mode_ = enabled;
 }
 void FFSVolume::mkdir(const std::string& path) {
     if (read_only_) throw FSError("device is read-only");
@@ -1441,6 +1479,7 @@ void FFSVolume::mkdir(const std::string& path) {
     write_buf(blk, buf);
 
     link_entry(parent.blk, blk, name);
+    flush_dirty_dirs();
     bitmap->flush();
 }
 
@@ -1570,7 +1609,8 @@ void FFSVolume::makedirs(const std::string& path) {
             nbuf.fix_checksum();
             write_buf(new_blk, nbuf);
             link_entry(cur_blk, new_blk, seg);
-            bitmap->flush();
+            flush_dirty_dirs();
+    bitmap->flush();
 
             if (dir_cache_.size() < 65536) {
                 dir_cache_[key] = new_blk;
@@ -1599,6 +1639,7 @@ void FFSVolume::delete_path(const std::string& path, bool recursive) {
     for (uint32_t b : blocks) {
         bitmap->free(b);
     }
+    flush_dirty_dirs();
     bitmap->flush();
 }
 

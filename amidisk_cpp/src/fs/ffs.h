@@ -39,6 +39,7 @@ constexpr uint32_t MAX_CHAIN = 1000000;
 
 class BlockBuf {
 public:
+    BlockBuf() : bs_(512), nl_(128) { data_.resize(512, 0); }  // Default for map usage
     BlockBuf(uint32_t bs);
     BlockBuf(std::span<const uint8_t> data, uint32_t bs);
 
@@ -207,6 +208,17 @@ private:
     // to the same directory consecutively. Caching the last resolved parent
     // avoids O(depth) resolve() calls for each file in the same dir.
     std::string last_parent_path_;
+
+    // PERF: Dirty directory caching - in bulk mode, directory blocks are
+    // modified frequently (once per file added). Instead of writing after
+    // each link_entry, we cache dirty dir blocks and flush them all at once.
+    // For 251K files in 12K dirs, this saves ~239K directory writes.
+    std::unordered_map<uint32_t, BlockBuf> dirty_dirs_;
+    bool bulk_mode_ = false;
+
+    void flush_dirty_dirs();
+    void set_bulk_mode(bool enabled);
+    friend class BulkGuard;
     FFSEntry last_parent_entry_;
 
     std::unordered_set<std::string> dir_name_set(const BlockBuf& dir_buf);
