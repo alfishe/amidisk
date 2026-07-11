@@ -932,14 +932,21 @@ CheckReport FFSVolume::check(bool deep) {
     // Python optimized this to ~1s by pre-building the expected bitmap array and comparing 
     // whole bitmap pages using `memcmp`. We do the same: we build the expected state in a 
     // fast contiguous byte array and skip intact blocks at memcmp speed.
-    std::vector<uint8_t> expected(npages * (bs - 4), 0xFF);
+    uint32_t bytes_per_page = bs - 4;  // Excluding checksum
+    std::vector<uint8_t> expected(npages * bytes_per_page, 0xFF);
     for (const auto& [blk, owner] : used) {
         if (blk >= reserved && blk < total) {
             uint32_t idx = blk - reserved;
-            uint32_t w = idx / 32;
-            uint32_t b = idx % 32;
-            uint32_t byte_idx = w * 4 + (3 - b / 8);
-            expected[byte_idx] &= ~(1 << (b % 8));
+            uint32_t pi = idx / bpp;
+            uint32_t off = idx % bpp;
+            uint32_t w = off / 32;
+            uint32_t b = off % 32;
+            // Byte within the page's bitmap data (after checksum)
+            uint32_t page_byte = w * 4 + (3 - b / 8);
+            uint32_t byte_idx = pi * bytes_per_page + page_byte;
+            if (byte_idx < expected.size()) {
+                expected[byte_idx] &= ~(1 << (b % 8));
+            }
         }
     }
     
@@ -1209,7 +1216,7 @@ void FFSVolume::format(const std::string& name, uint32_t dos_type_val) {
     
     // write bitmap blocks
     for (uint32_t pi = 0; pi < npages; ++pi) {
-        bitmap->pages_[pi].fix_checksum();
+        bitmap->pages_[pi].fix_checksum(0);  // Bitmap pages have checksum at long 0, not 5
         write_buf(page_blks[pi], bitmap->pages_[pi]);
     }
 
@@ -1532,37 +1539,43 @@ void FFSVolume::unlink_entry(const FFSEntry& entry) {
 }
 
 std::vector<uint32_t> FFSVolume::entry_blocks(const FFSEntry& entry) {
+    // All blocks belonging to a file/link header (header, exts, data)
+    // Matches Python's _entry_blocks implementation
     std::vector<uint32_t> blocks;
     blocks.push_back(entry.blk);
     if (entry.comment_block) blocks.push_back(entry.comment_block);
-    
+
     if (entry.sec_type == ST_SOFTLINK || entry.sec_type == ST_LINKFILE || entry.sec_type == ST_LINKDIR) {
         return blocks;
     }
     if (entry.sec_type == ST_USERDIR) {
         return blocks; // DirCache blocks are not implemented, so just the dir block
     }
-    
-    // Instead of doing it manually, we can just use `data_runs` which parses all T_LIST blocks!
-    auto runs = data_runs(entry);
-    for (const auto& run : runs) {
-        blocks.push_back(run.first);
-    }
-    
-    // BUT we also need the T_LIST blocks themselves!
+
+    // Walk through file header and all extension blocks, collecting:
+    // 1. Data block pointers from each header/extension
+    // 2. Extension blocks themselves
     uint32_t blk = entry.blk;
     int guard = 0;
     while (blk != 0) {
         if (++guard > MAX_CHAIN) throw FSError("cyclic extension chain");
         BlockBuf buf = read_buf(blk);
-        if (blk == entry.blk) {
-            blk = buf.long_val(3);
-        } else {
-            blocks.push_back(blk);
-            blk = buf.long_val(1);
+
+        // Get data block pointers from this block
+        uint32_t count = buf.long_val(2);  // block count
+        count = std::min(count, tsz);
+        for (uint32_t k = 0; k < count; ++k) {
+            uint32_t ptr = buf.long_val(6 + tsz - 1 - k);
+            if (ptr) blocks.push_back(ptr);
+        }
+
+        // Move to next extension block
+        blk = buf.long_val(-2);
+        if (blk != 0) {
+            blocks.push_back(blk);  // Add the extension block itself
         }
     }
-    
+
     return blocks;
 }
 

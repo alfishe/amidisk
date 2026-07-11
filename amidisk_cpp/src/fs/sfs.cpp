@@ -3,6 +3,7 @@
 #include "util.h"
 #include "../blkdev/blkdev.h"
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <iostream>
 #include <unordered_set>

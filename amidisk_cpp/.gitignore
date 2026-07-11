@@ -1,0 +1,22 @@
+# Build artifacts
+build/
+cmake-build*/
+.cache/
+
+# IDE/editor files
+.idea/
+.vscode/
+*.swp
+*~
+
+# macOS metadata
+.DS_Store
+._*
+
+# Test artifacts
+data_tmp/
+*.img
+*.hdf
+
+# Temporary files
+*.tmp

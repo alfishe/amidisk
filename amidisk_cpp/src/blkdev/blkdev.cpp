@@ -4,8 +4,18 @@
 #include <fstream>
 #include <cstring>
 #include <filesystem>
+#include <cstdlib>
 
 namespace amidisk {
+
+static IOStrategy get_io_strategy() {
+    const char* env = std::getenv("AMIDISK_IO");
+    if (env) {
+        if (std::strcmp(env, "mmap") == 0) return IOStrategy::Mmap;
+        if (std::strcmp(env, "fstream") == 0) return IOStrategy::Fstream;
+    }
+    return IOStrategy::Posix;  // Default
+}
 
 std::shared_ptr<BlockDevice> open_blkdev(const std::string& path, bool read_only) {
     // Check if it's a VHD by reading the footer
@@ -21,9 +31,9 @@ std::shared_ptr<BlockDevice> open_blkdev(const std::string& path, bool read_only
             }
         }
     }
-    
-    // Default to plain image file
-    return std::make_shared<ImageFileBlkDev>(path, read_only);
+
+    // Default to plain image file with configurable I/O strategy
+    return std::make_shared<ImageFileBlkDev>(path, read_only, 512, get_io_strategy());
 }
 
 } // namespace amidisk

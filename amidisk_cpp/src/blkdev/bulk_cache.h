@@ -47,6 +47,9 @@ private:
     uint64_t pending_ = 0;
     uint64_t flush_threshold_;
 
+    // PERF: Reusable buffer for flush_cache to avoid repeated allocations
+    mutable std::vector<uint8_t> flush_buffer_;
+
     // Look up a single block in the big-write cache
     const uint8_t* big_lookup(uint64_t blk) const;
 };

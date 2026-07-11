@@ -58,6 +58,8 @@ inline ParsedArg parse_image_arg(const std::string& image_arg, const std::string
 
 using namespace amidisk;
 
+// Forward declarations
+static int64_t get_file_mtime_unix(const std::string& path);
 
 void cmd_info(const std::string& image_path, const std::string& vol_name) {
     try {
@@ -176,13 +178,48 @@ void cmd_info(const std::string& image_path, const std::string& vol_name) {
 #include <iomanip>
 #include <fstream>
 
-void cmd_create(const std::string& image_path, uint32_t size_mb) {
+uint64_t parse_size_string(const std::string& s) {
+    if (s.empty()) return 10 * 1024 * 1024;
+    uint64_t mult = 1;
+    std::string num_part = s;
+    char suffix = std::toupper(s.back());
+    if (suffix == 'K') { mult = 1024; num_part = s.substr(0, s.size() - 1); }
+    else if (suffix == 'M') { mult = 1024 * 1024; num_part = s.substr(0, s.size() - 1); }
+    else if (suffix == 'G') { mult = 1024ULL * 1024 * 1024; num_part = s.substr(0, s.size() - 1); }
+    return std::stoull(num_part) * mult;
+}
+
+void cmd_create(const std::string& image_path, const std::string& size_str, const std::string& format_label, const std::string& dostype_str) {
     try {
+        uint64_t size_bytes = parse_size_string(size_str);
         std::ofstream file(image_path, std::ios::binary);
         if (!file.is_open()) throw std::runtime_error("Cannot create file: " + image_path);
-        file.seekp(size_mb * 1024 * 1024 - 1);
+        file.seekp(size_bytes - 1);
         file.write("", 1);
-        std::cout << "Created raw image: " << image_path << " (" << size_mb << " MB)" << std::endl;
+        file.close();
+        std::cout << "Created raw image: " << image_path << " (" << (size_bytes / (1024 * 1024)) << " MB)" << std::endl;
+
+        if (!format_label.empty()) {
+            auto img = DiskImage::open(image_path, false);
+            auto vol_ref = img->get_volume("DH0");
+            if (vol_ref) {
+                auto bdev = vol_ref->create_blkdev();
+                uint32_t dos_type = 0x444F5307;
+                if (!dostype_str.empty()) {
+                    if (dostype_str == "ofs") dos_type = 0x444F5300;
+                    else if (dostype_str == "ffs") dos_type = 0x444F5301;
+                    else if (dostype_str == "ofs-intl") dos_type = 0x444F5302;
+                    else if (dostype_str == "ffs-intl") dos_type = 0x444F5303;
+                    else if (dostype_str == "ofs-intl-dc") dos_type = 0x444F5304;
+                    else if (dostype_str == "ffs-intl-dc") dos_type = 0x444F5305;
+                    else if (dostype_str == "ofs-intl-lnfs") dos_type = 0x444F5306;
+                    else if (dostype_str == "ffs-intl-lnfs" || dostype_str == "dos7") dos_type = 0x444F5307;
+                }
+                FFSVolume vol(bdev);
+                vol.format(format_label, dos_type);
+                std::cout << "Formatted as " << format_label << std::endl;
+            }
+        }
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
     }
@@ -232,7 +269,129 @@ void cmd_format(const std::string& image_path, const std::string& volume_name, c
     }
 }
 
-void cmd_cp(const std::string& image_path, const std::string& volume_name, const std::string& tar_path, const std::string& dest_path, bool bulk) {
+// Implementation of put logic that works on an already-mounted Volume
+// This allows cmd_cp to reuse the put logic for non-archive sources
+void cmd_put_impl(Volume* vol, const std::string& src_path, const std::string& dest_path,
+                  bool recursive, const std::string& protect_str, const std::string& comment) {
+    uint32_t protect = 0;
+    // Parse protect string if provided (e.g. "rwedspa")
+    for (char c : protect_str) {
+        switch (std::tolower(c)) {
+            case 'r': protect |= 0x08; break;
+            case 'w': protect |= 0x04; break;
+            case 'e': protect |= 0x02; break;
+            case 'd': protect |= 0x01; break;
+            case 's': protect |= 0x40; break;
+            case 'p': protect |= 0x20; break;
+            case 'a': protect |= 0x10; break;
+        }
+    }
+
+    uint32_t max_name_len = 107;
+
+    if (std::filesystem::is_regular_file(src_path)) {
+        std::string basename = truncate_name(std::filesystem::path(src_path).filename().string(), max_name_len);
+        std::string amiga_path = dest_path;
+
+        if (amiga_path.empty() || amiga_path.back() == '/') {
+            amiga_path += basename;
+        } else {
+            try {
+                auto entries = vol->list_dir(amiga_path);
+                amiga_path = amiga_path + "/" + basename;
+            } catch (...) {
+                // dest_path is the target filename
+            }
+        }
+
+        std::ifstream ifs(src_path, std::ios::binary);
+        if (!ifs) {
+            throw std::runtime_error("Cannot open file: " + src_path);
+        }
+
+        std::vector<uint8_t> data((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        ifs.close();
+
+        WriteParams params;
+        params.protect = protect;
+        params.comment = comment;
+        params.mtime = get_file_mtime_unix(src_path);
+
+        vol->write_file(amiga_path, data, params);
+        out::print((fmt() << "Wrote " << amiga_path << " (" << data.size() << " bytes)").str());
+        return;
+    }
+
+    if (std::filesystem::is_directory(src_path)) {
+        if (!recursive) {
+            throw std::runtime_error(src_path + " is a directory (use -r)");
+        }
+
+        std::string base = dest_path;
+        while (!base.empty() && base.back() == '/') base.pop_back();
+
+        // Include the source directory name in the destination (like cp -r behavior)
+        std::string src_basename = truncate_name(std::filesystem::path(src_path).filename().string(), max_name_len);
+        if (base.empty()) {
+            base = src_basename;
+        } else {
+            base = base + "/" + src_basename;
+        }
+        vol->makedirs(base);
+
+        uint64_t total_expected = 0;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(src_path)) {
+            if (entry.is_regular_file()) {
+                total_expected += entry.file_size();
+            }
+        }
+
+        uint32_t file_count = 0;
+        uint64_t total_bytes = 0;
+        auto start = std::chrono::steady_clock::now();
+
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(src_path)) {
+            auto rel = std::filesystem::relative(entry.path(), src_path);
+            std::string rel_str;
+            for (const auto& part : rel) {
+                if (!rel_str.empty()) rel_str += "/";
+                rel_str += truncate_name(part.string(), max_name_len);
+            }
+
+            std::string amiga_path = base.empty() ? rel_str : (base + "/" + rel_str);
+
+            if (entry.is_directory()) {
+                vol->makedirs(amiga_path);
+            } else if (entry.is_regular_file()) {
+                std::string parent = amiga_path;
+                auto slash = parent.rfind('/');
+                if (slash != std::string::npos) {
+                    parent = parent.substr(0, slash);
+                    if (!parent.empty()) vol->makedirs(parent);
+                }
+
+                std::ifstream ifs(entry.path(), std::ios::binary);
+                std::vector<uint8_t> data((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+                ifs.close();
+
+                WriteParams params;
+                params.protect = protect;
+                params.comment = comment;
+                params.mtime = get_file_mtime_unix(entry.path().string());
+
+                vol->write_file(amiga_path, data, params);
+                file_count++;
+                total_bytes += data.size();
+                print_progress(total_bytes, total_expected, rel_str);
+            }
+        }
+
+        auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        print_transfer_stats(file_count, 0, total_bytes, elapsed);
+    }
+}
+
+void cmd_cp(const std::string& image_path, const std::string& volume_name, const std::string& src_path, const std::string& dest_path, bool bulk, bool recursive) {
     try {
         auto img = DiskImage::open(image_path, false);
         auto vol_ref = img->get_volume(volume_name);
@@ -249,18 +408,46 @@ void cmd_cp(const std::string& image_path, const std::string& volume_name, const
             bulk_guard = std::make_unique<BulkGuard>(vol->blkdev_ref());
         }
 
-        auto handler = create_archive_handler(tar_path);
+        // Check if src is an archive
+        auto handler = create_archive_handler(src_path);
         if (handler) {
+            // It's an archive - extract it
             if (!handler->test_archive()) {
                 std::cerr << "Archive integrity check failed." << std::endl;
                 return;
             }
             auto [files, dirs, bytes] = handler->stream_to_volume(vol, dest_path, 107, 0, "");
             std::cout << "\nExtracted " << files << " files, " << dirs << " directories (" << bytes << " bytes) to " << (dest_path.empty() ? "/" : dest_path) << std::endl;
-        } else {
-            TarExtractor tar(tar_path);
+            return;
+        }
+
+        // Check if it's a tar file (fallback for .tar without magic detection)
+        std::string lower_src = src_path;
+        std::transform(lower_src.begin(), lower_src.end(), lower_src.begin(), ::tolower);
+        if (lower_src.ends_with(".tar")) {
+            TarExtractor tar(src_path);
             tar.extract_to(vol, dest_path);
-            std::cout << "Extracted " << tar_path << " to " << (dest_path.empty() ? "/" : dest_path) << std::endl;
+            std::cout << "Extracted " << src_path << " to " << (dest_path.empty() ? "/" : dest_path) << std::endl;
+            return;
+        }
+
+        // Not an archive - treat as regular file/directory (like put command)
+        std::filesystem::path src_fs(src_path);
+        if (!std::filesystem::exists(src_fs)) {
+            std::cerr << "Error: Source not found: " << src_path << std::endl;
+            return;
+        }
+
+        if (std::filesystem::is_directory(src_fs)) {
+            if (!recursive) {
+                std::cerr << "Error: " << src_path << " is a directory, use -r for recursive copy" << std::endl;
+                return;
+            }
+            // Recursive directory copy
+            cmd_put_impl(vol, src_path, dest_path, true, "", "");
+        } else {
+            // Single file copy
+            cmd_put_impl(vol, src_path, dest_path, false, "", "");
         }
         // BulkGuard destructor flushes automatically
     } catch (const std::exception& e) {
@@ -897,14 +1084,17 @@ int main(int argc, char** argv) {
         cmd_check(parsed.image, parsed.vol, deep);
     });
 
-    // Create command
-    auto create_cmd = app.add_subcommand("create", "Create an empty raw disk image");
+    // Create command (matches Python: create image --size 27G --format LABEL --dostype ffs-intl-lnfs)
+    auto create_cmd = app.add_subcommand("create", "Create a new blank image");
     create_cmd->add_option("image", image_path, "Path to the disk image")->required();
-    uint32_t size_mb = 10;
-    create_cmd->add_option("-s,--size", size_mb, "Size in MB (default: 10)");
+    std::string create_size = "10M";
+    std::string create_format_label;
+    std::string create_dostype;
+    create_cmd->add_option("--size", create_size, "Image size (e.g. 100M, 1G)");
+    create_cmd->add_option("--format", create_format_label, "Format after creating with this label");
+    create_cmd->add_option("--dostype", create_dostype, "DOS type (ofs|ffs|ofs-intl|ffs-intl|ffs-intl-lnfs|dos7)");
     create_cmd->callback([&]() {
-        auto parsed = parse_image_arg(image_path);
-        cmd_create(parsed.image, size_mb);
+        cmd_create(image_path, create_size, create_format_label, create_dostype);
     });
     
     // Format command
@@ -957,17 +1147,19 @@ int main(int argc, char** argv) {
     });
 
     // Cp command (Archive extraction or file copy)
-    // Matches Python: cp src dst (e.g., cp archive.tar image.hdf:DH0/)
-    auto cp_cmd = app.add_subcommand("cp", "Copy files from an archive (tar, zip, lha, rar, 7z) to the volume");
+    // Matches Python: cp src dst (e.g., cp archive.tar image.hdf:DH0/ or cp file.txt image.hdf:DH0/)
+    auto cp_cmd = app.add_subcommand("cp", "Copy files/directories/archives to the volume");
     std::string cp_src, cp_dst;
-    cp_cmd->add_option("src", cp_src, "Source archive (tar, zip, lha, rar, 7z)")->required();
+    cp_cmd->add_option("src", cp_src, "Source file, directory, or archive")->required();
     cp_cmd->add_option("dst", cp_dst, "Destination image:volume/path")->required();
     bool cp_bulk = false;
+    bool cp_recursive = false;
     cp_cmd->add_flag("--bulk", cp_bulk, "Use bulk write cache for better performance");
+    cp_cmd->add_flag("-r,--recursive", cp_recursive, "Recursively copy directories");
     cp_cmd->callback([&]() {
         auto parsed = parse_image_arg(cp_dst);
         std::string dest = parsed.path.empty() ? "/" : "/" + parsed.path;
-        cmd_cp(parsed.image, parsed.vol, cp_src, dest, cp_bulk);
+        cmd_cp(parsed.image, parsed.vol, cp_src, dest, cp_bulk, cp_recursive);
     });
 
     // mkdir

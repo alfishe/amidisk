@@ -147,46 +147,47 @@ void BulkWriteCache::flush_cache() {
 
     uint64_t bb = block_bytes_;
 
-    // Merge small and big entries, sort by start block
+    // PERF: Use span-based entries to avoid copying data during sort
     struct Entry {
         uint64_t start;
         uint64_t nblocks;
-        std::vector<uint8_t> data;
+        const uint8_t* data;
+        size_t size;
     };
 
     std::vector<Entry> items;
     items.reserve(small_.size() + big_.size());
 
-    for (auto& [blk, data] : small_) {
-        items.push_back({blk, 1, std::move(data)});
+    for (const auto& [blk, data] : small_) {
+        items.push_back({blk, 1, data.data(), data.size()});
     }
-    for (auto& [s, n, data] : big_) {
-        items.push_back({s, n, std::move(data)});
+    for (const auto& [s, n, data] : big_) {
+        items.push_back({s, n, data.data(), data.size()});
     }
 
     std::sort(items.begin(), items.end(),
               [](const Entry& a, const Entry& b) { return a.start < b.start; });
 
     // Coalesce consecutive entries into large writes
+    // PERF: Reuse flush_buffer_ instead of allocating per run
     constexpr uint64_t MAXRUN = 32ULL << 20;  // 32 MB
     size_t i = 0;
     while (i < items.size()) {
         uint64_t start = items[i].start;
-        std::vector<uint8_t> combined;
-        combined.reserve(items[i].data.size());
-        combined.insert(combined.end(), items[i].data.begin(), items[i].data.end());
+        flush_buffer_.clear();
+        flush_buffer_.insert(flush_buffer_.end(), items[i].data, items[i].data + items[i].size);
         uint64_t end = items[i].start + items[i].nblocks;
 
         size_t j = i + 1;
         while (j < items.size() &&
                items[j].start == end &&
-               combined.size() + items[j].data.size() <= MAXRUN) {
-            combined.insert(combined.end(), items[j].data.begin(), items[j].data.end());
+               flush_buffer_.size() + items[j].size <= MAXRUN) {
+            flush_buffer_.insert(flush_buffer_.end(), items[j].data, items[j].data + items[j].size);
             end += items[j].nblocks;
             j++;
         }
 
-        base_->write(start * bb, combined);
+        base_->write(start * bb, flush_buffer_);
         i = j;
     }
 

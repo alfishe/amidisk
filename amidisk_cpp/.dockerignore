@@ -1,0 +1,14 @@
+# Exclude build artifacts (will be rebuilt in container)
+build/
+cmake-build*/
+.cache/
+
+# Exclude IDE/editor files
+.idea/
+.vscode/
+*.swp
+*~
+
+# Exclude macOS metadata
+.DS_Store
+._*

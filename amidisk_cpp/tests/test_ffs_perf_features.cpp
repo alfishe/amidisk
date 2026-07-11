@@ -3,6 +3,7 @@
 #include "blkdev/blkdev.h"
 #include "blkdev/bulk_cache.h"
 
+#include <cstring>
 #include <random>
 #include <chrono>
 #include <set>
