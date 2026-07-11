@@ -30,12 +30,12 @@
  *
  * | Strategy | macOS | Linux | Windows | Other POSIX |
  * |----------|-------|-------|---------|-------------|
- * | Mmap     | Yes   | Yes   | No*     | Yes         |
- * | Posix    | Yes   | Yes   | Yes**   | Yes         |
+ * | Mmap     | Yes   | Yes   | Yes     | Yes         |
+ * | Posix    | Yes   | Yes   | Yes     | Yes         |
  * | Fstream  | Yes   | Yes   | Yes     | Yes         |
  *
- * *  Windows mmap (MapViewOfFile) could be added but isn't implemented yet
- * ** Windows uses ReadFile/WriteFile with OVERLAPPED for positional I/O
+ * Windows uses CreateFileMapping/MapViewOfFile for mmap, and
+ * ReadFile/WriteFile with OVERLAPPED for positional I/O (Posix strategy).
  *
  * ## Selection via Environment Variable
  *
@@ -130,6 +130,12 @@ private:
     void teardown_mmap();      ///< Release memory mapping
 #elif USE_WIN32_IO
     HANDLE handle_ = INVALID_HANDLE_VALUE;  ///< File handle for Win32 I/O
+    HANDLE mapping_ = nullptr;              ///< File mapping handle for mmap strategy
+    uint8_t* mmap_ptr_ = nullptr;           ///< Mapped memory region
+    size_t mmap_size_ = 0;                  ///< Size of mapped region
+
+    void setup_mmap();         ///< Establish memory mapping via CreateFileMapping
+    void teardown_mmap();      ///< Release memory mapping
 #endif
 
     mutable std::fstream file_;  ///< Fstream for portable fallback

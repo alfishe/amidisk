@@ -93,10 +93,7 @@ ImageFileBlkDev::ImageFileBlkDev(const std::string& path, bool read_only, uint32
             size_bytes_ = static_cast<uint64_t>(li.QuadPart);
         }
     } else if (strategy_ == IOStrategy::Mmap) {
-        // Mmap not yet implemented on Windows; fall back to Win32 positional I/O
-        // Just use the Posix (Win32) code path directly
-        strategy_ = IOStrategy::Posix;
-
+        // Windows mmap via CreateFileMapping + MapViewOfFile
         DWORD access = read_only_ ? GENERIC_READ : (GENERIC_READ | GENERIC_WRITE);
         DWORD creation = read_only_ ? OPEN_EXISTING : OPEN_ALWAYS;
         DWORD flags = FILE_ATTRIBUTE_NORMAL;
@@ -118,6 +115,11 @@ ImageFileBlkDev::ImageFileBlkDev(const std::string& path, bool read_only, uint32
         LARGE_INTEGER li;
         if (GetFileSizeEx(handle_, &li)) {
             size_bytes_ = static_cast<uint64_t>(li.QuadPart);
+        }
+
+        // Setup memory mapping if file has content
+        if (size_bytes_ > 0) {
+            setup_mmap();
         }
     } else
 #endif
@@ -158,7 +160,7 @@ ImageFileBlkDev::~ImageFileBlkDev() {
 }
 
 // ============================================================================
-// POSIX mmap support
+// Memory mapping support
 // ============================================================================
 
 #if USE_POSIX_IO
@@ -184,6 +186,49 @@ void ImageFileBlkDev::teardown_mmap() {
         ::munmap(mmap_ptr_, mmap_size_);
         mmap_ptr_ = nullptr;
         mmap_size_ = 0;
+    }
+}
+
+#elif USE_WIN32_IO
+void ImageFileBlkDev::setup_mmap() {
+    if (mmap_ptr_ != nullptr) return;
+    if (handle_ == INVALID_HANDLE_VALUE) return;
+
+    // Create file mapping
+    DWORD protect = read_only_ ? PAGE_READONLY : PAGE_READWRITE;
+    DWORD high = static_cast<DWORD>(size_bytes_ >> 32);
+    DWORD low = static_cast<DWORD>(size_bytes_ & 0xFFFFFFFF);
+
+    mapping_ = CreateFileMappingA(handle_, nullptr, protect, high, low, nullptr);
+    if (mapping_ == nullptr) {
+        // Fall back to ReadFile/WriteFile
+        strategy_ = IOStrategy::Posix;
+        return;
+    }
+
+    // Map view of file
+    DWORD access = read_only_ ? FILE_MAP_READ : FILE_MAP_WRITE;
+    mmap_ptr_ = static_cast<uint8_t*>(MapViewOfFile(mapping_, access, 0, 0, 0));
+    if (mmap_ptr_ == nullptr) {
+        CloseHandle(mapping_);
+        mapping_ = nullptr;
+        strategy_ = IOStrategy::Posix;
+        return;
+    }
+
+    mmap_size_ = size_bytes_;
+}
+
+void ImageFileBlkDev::teardown_mmap() {
+    if (mmap_ptr_ != nullptr) {
+        FlushViewOfFile(mmap_ptr_, 0);
+        UnmapViewOfFile(mmap_ptr_);
+        mmap_ptr_ = nullptr;
+        mmap_size_ = 0;
+    }
+    if (mapping_ != nullptr) {
+        CloseHandle(mapping_);
+        mapping_ = nullptr;
     }
 }
 #endif
@@ -259,6 +304,12 @@ void ImageFileBlkDev::read(uint64_t offset, std::span<uint8_t> buffer) const {
     }
 
 #elif USE_WIN32_IO
+    // Mmap path: direct memory copy, no syscall
+    if (strategy_ == IOStrategy::Mmap && mmap_ptr_ != nullptr) {
+        std::memcpy(buffer.data(), mmap_ptr_ + offset, buffer.size());
+        return;
+    }
+
     // Win32 path: ReadFile with OVERLAPPED for positional I/O
     if (strategy_ == IOStrategy::Posix && handle_ != INVALID_HANDLE_VALUE) {
         OVERLAPPED ov = {};
@@ -313,11 +364,21 @@ void ImageFileBlkDev::write(uint64_t offset, std::span<const uint8_t> buffer) {
 #elif USE_WIN32_IO
         // Extend file by seeking and setting end-of-file
         if (handle_ != INVALID_HANDLE_VALUE) {
+            // Must unmap before extending
+            if (strategy_ == IOStrategy::Mmap) {
+                teardown_mmap();
+            }
+
             LARGE_INTEGER li;
             li.QuadPart = static_cast<LONGLONG>(size_bytes_);
             if (!SetFilePointerEx(handle_, li, nullptr, FILE_BEGIN) ||
                 !SetEndOfFile(handle_)) {
                 throw BlockDeviceError("Failed to extend file");
+            }
+
+            // Re-establish mmap for new size
+            if (strategy_ == IOStrategy::Mmap) {
+                setup_mmap();
             }
         }
 #endif
@@ -340,6 +401,12 @@ void ImageFileBlkDev::write(uint64_t offset, std::span<const uint8_t> buffer) {
     }
 
 #elif USE_WIN32_IO
+    // Mmap path: direct memory copy, kernel handles writeback
+    if (strategy_ == IOStrategy::Mmap && mmap_ptr_ != nullptr) {
+        std::memcpy(mmap_ptr_ + offset, buffer.data(), buffer.size());
+        return;
+    }
+
     // Win32 path: WriteFile with OVERLAPPED for positional I/O
     if (strategy_ == IOStrategy::Posix && handle_ != INVALID_HANDLE_VALUE) {
         OVERLAPPED ov = {};
@@ -383,6 +450,13 @@ void ImageFileBlkDev::flush() {
     }
 
 #elif USE_WIN32_IO
+    // Mmap: FlushViewOfFile forces dirty pages to disk
+    if (strategy_ == IOStrategy::Mmap && mmap_ptr_ != nullptr) {
+        FlushViewOfFile(mmap_ptr_, 0);
+        FlushFileBuffers(handle_);
+        return;
+    }
+
     // Win32: FlushFileBuffers
     if (handle_ != INVALID_HANDLE_VALUE) {
         FlushFileBuffers(handle_);
@@ -408,6 +482,7 @@ void ImageFileBlkDev::close() {
         fd_ = -1;
     }
 #elif USE_WIN32_IO
+    teardown_mmap();
     if (handle_ != INVALID_HANDLE_VALUE) {
         CloseHandle(handle_);
         handle_ = INVALID_HANDLE_VALUE;
