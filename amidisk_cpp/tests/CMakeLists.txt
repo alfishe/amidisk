@@ -11,6 +11,7 @@ add_executable(amidisk_tests
     test_ffs.cpp
     test_ffs_modify.cpp
     test_ffs_smoke.cpp
+    test_ffs_perf_features.cpp
     test_archives.cpp
     test_pfs3_read.cpp
     test_pfs3_write.cpp
