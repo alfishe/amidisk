@@ -2,7 +2,8 @@ import unittest
 import os
 import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.join(os.path.dirname(TEST_DIR), "src")
 sys.path.insert(0, ROOT)
 
 from amidisk.cli import cmd_create, cmd_rdb_init, cmd_part_add, cmd_format
@@ -23,7 +24,7 @@ class TestCliFormat(unittest.TestCase):
         
         for fs in fs_types:
             with self.subTest(fs=fs):
-                img_path = f"tests/scratch_format_{fs}.hdf"
+                img_path = os.path.join(TEST_DIR, f"scratch_format_{fs}.hdf")
                 if os.path.exists(img_path):
                     os.remove(img_path)
                 

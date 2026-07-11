@@ -15,7 +15,8 @@ import unittest
 
 SCRATCH_BASE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scratch")
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.join(os.path.dirname(TEST_DIR), "src")
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 

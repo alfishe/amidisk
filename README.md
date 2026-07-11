@@ -7,8 +7,8 @@ native PFS3 and SFS readers, filesystem check/repair, and an RDB rescue
 tool for disks whose partition table was overwritten.
 
 Implements the native-engine part of `doc/amiga-disk-tool-architecture.md`.
-No dependencies, Python ≥ 3.9. `pip install -e .` installs the `amidisk`
-command (or run `python3 -m amidisk.cli`).
+No dependencies, Python ≥ 3.9. `pip install -e ./amidisk_python` installs the `amidisk`
+command (or run `PYTHONPATH=amidisk_python/src python3 -m amidisk.cli`).
 
 ## Support matrix
 
@@ -52,9 +52,9 @@ untouched files stay bit-identical. Caveat: SFS has no second local
 implementation to differential-test against (hst-imager lacks SFS), so
 the final oracle for SFS writes remains a mount under the real handler.
 
-Test suites: `python3 tests/smoke.py`, plus
-`python3 -m unittest discover -s tests -t .` (PFS3 unit tests in
-`tests/pfs3/`, SFS in `tests/sfs/`; hst-imager interop tests skip unless
+Test suites: `python3 amidisk_python/tests/smoke.py`, plus
+`PYTHONPATH=amidisk_python/src python3 -m unittest discover -s amidisk_python/tests -t amidisk_python` (PFS3 unit tests in
+`amidisk_python/tests/pfs3/`, SFS in `amidisk_python/tests/sfs/`; hst-imager interop tests skip unless
 `HST_IMAGER` points at the binary).
 
 ## CLI
@@ -150,24 +150,28 @@ and `rescue`), `amidisk.fs.ffs` / `fs.pfs3` / `fs.sfs`.
 ## Layout
 
 ```
-amidisk/
-  blkdev.py       L0/L1: image containers as block devices + COW overlay
-  rdb/blocks.py   RDSK/PART/FSHD/LSEG structures (amitools rdblib port)
-  rdb/rdisk.py    RDB orchestration: parse, create, partition CRUD
-  rdb/rescue.py   lost-partition scanner + RDB rebuilder
-  fs/ffs.py       native OFS/FFS engine (read/write/format/check/repair)
-  fs/pfs3.py      native PFS3 reader (pfs3aio structures)
-  fs/sfs.py       native SFS reader (AROS SFS structures)
-  image.py        DiskImage facade: detection, volume dispatch
-  cli.py          amidisk CLI
-tests/smoke.py    test suite (uses data/ and data/test/ images)
+amidisk_python/
+  pyproject.toml  Python package metadata and script entrypoints
+  src/
+    amidisk/
+      blkdev.py       L0/L1: image containers as block devices + COW overlay
+      rdb/blocks.py   RDSK/PART/FSHD/LSEG structures (amitools rdblib port)
+      rdb/rdisk.py    RDB orchestration: parse, create, partition CRUD
+      rdb/rescue.py   lost-partition scanner + RDB rebuilder
+      fs/ffs.py       native OFS/FFS engine (read/write/format/check/repair)
+      fs/pfs3.py      native PFS3 reader (pfs3aio structures)
+      fs/sfs.py       native SFS reader (AROS SFS structures)
+      image.py        DiskImage facade: detection, volume dispatch
+      cli.py          amidisk CLI
+  tests/
+    smoke.py      test suite (uses data/ and data/test/ images)
 data/test/        fixture images incl. real pfs3aio/SFS-written volumes
 ```
 
 ## Testing
 
 ```sh
-python3 tests/smoke.py
+python3 amidisk_python/tests/smoke.py
 ```
 
 Write tests only ever run on temporary copies. The images in `data/`

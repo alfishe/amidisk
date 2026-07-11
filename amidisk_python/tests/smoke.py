@@ -15,7 +15,9 @@ import subprocess
 import sys
 import tempfile
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.join(os.path.dirname(TEST_DIR), "src")
+REPO_ROOT = os.path.dirname(os.path.dirname(TEST_DIR))
 sys.path.insert(0, ROOT)
 
 from amidisk import open_image                      # noqa: E402
@@ -25,8 +27,8 @@ from amidisk.fs.pfs3 import PFS3Volume
 from amidisk.fs.sfs import SFSVolume
 from amidisk.rdb import RDisk                       # noqa: E402
 
-DATA = os.path.join(ROOT, "data")
-TESTDATA = os.path.join(ROOT, "tests", "data")
+DATA = os.path.join(REPO_ROOT, "data")
+TESTDATA = os.path.join(TEST_DIR, "data")
 
 SCRATCH_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scratch")
 

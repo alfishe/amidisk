@@ -15,12 +15,12 @@ namespace fs = std::filesystem;
 class ArchivesTest : public ::testing::Test {
 protected:
     std::string tmp_img = "test_archives.img";
-    std::string lha_file = "../tests/data/pfs3aio.lha"; // CMake usually sets working dir to build, wait, no, CTest sets it to build directory. So `../../tests/data` from `build`? Wait, let's use CMAKE_CURRENT_SOURCE_DIR? 
+    std::string lha_file = "../amidisk_python/tests/data/pfs3aio.lha"; // CMake usually sets working dir to build, wait, no, CTest sets it to build directory.
     // Actually we can just try multiple paths
     std::vector<std::string> search_paths = {
-        "../tests/data/pfs3aio.lha",
-        "../../tests/data/pfs3aio.lha",
-        "../../../tests/data/pfs3aio.lha"
+        "../amidisk_python/tests/data/pfs3aio.lha",
+        "../../amidisk_python/tests/data/pfs3aio.lha",
+        "../../../amidisk_python/tests/data/pfs3aio.lha"
     };
 
     void SetUp() override {

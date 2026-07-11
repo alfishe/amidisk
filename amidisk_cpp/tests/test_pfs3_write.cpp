@@ -11,7 +11,7 @@ namespace fs = std::filesystem;
 
 class PFS3WriteTest : public ::testing::Test {
 protected:
-    std::string test_dir = "tests/data_tmp";
+    std::string test_dir = "amidisk_python/tests/data_tmp";
     std::string cpp_img_path = test_dir + "/pfs3_cpp_format.hdf";
     std::string py_img_path = test_dir + "/pfs3_py_format.hdf";
     
@@ -39,13 +39,13 @@ protected:
     }
     
     void run_python_format(const std::string& img_path, const std::string& label) {
-        std::string cmd = "PYTHONPATH=.. python3 -m amidisk format --dostype 0x50465303 " + img_path + " " + label;
+        std::string cmd = "PYTHONPATH=../../../amidisk_python/src:../../amidisk_python/src:../amidisk_python/src:amidisk_python/src python3 -m amidisk format --dostype 0x50465303 " + img_path + " " + label;
         int res = system(cmd.c_str());
         ASSERT_EQ(res, 0);
     }
     
     void run_python_cp(const std::string& img_path, const std::string& src, const std::string& dst) {
-        std::string cmd = "PYTHONPATH=.. python3 -m amidisk cp " + img_path + " " + src + " " + dst;
+        std::string cmd = "PYTHONPATH=../../../amidisk_python/src:../../amidisk_python/src:../amidisk_python/src:amidisk_python/src python3 -m amidisk cp " + img_path + " " + src + " " + dst;
         int res = system(cmd.c_str());
         ASSERT_EQ(res, 0);
     }

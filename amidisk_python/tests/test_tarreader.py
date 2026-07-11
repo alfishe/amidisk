@@ -10,14 +10,16 @@ import unittest
 
 SCRATCH_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scratch")
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.join(os.path.dirname(TEST_DIR), "src")
+REPO_ROOT = os.path.dirname(os.path.dirname(TEST_DIR))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from amidisk.tarreader import (  # noqa: E402
     ClassicTarReader, LibarchiveTarReader, LibarchiveError, open_tar)
 
-REAL_TAR = os.path.join(ROOT, "data", "amiga_content.tar")
+REAL_TAR = os.path.join(REPO_ROOT, "data", "amiga_content.tar")
 
 
 def _inventory(path, engine, with_data=True):

@@ -52,8 +52,8 @@ private:
 // ============================================================================
 
 TEST(FFSVolumeTest, ReadParityFfsDc) {
-    if (!std::filesystem::exists("../../tests/data/ffs-dc-amidisk.hdf")) GTEST_SKIP() << "ffs-dc-amidisk.hdf missing";
-    auto img = DiskImage::open("../../tests/data/ffs-dc-amidisk.hdf");
+    if (!std::filesystem::exists("../../amidisk_python/tests/data/ffs-dc-amidisk.hdf")) GTEST_SKIP() << "ffs-dc-amidisk.hdf missing";
+    auto img = DiskImage::open("../../amidisk_python/tests/data/ffs-dc-amidisk.hdf");
     ASSERT_NE(img, nullptr);
 
     auto vol_ref = img->get_volume("DF0");
@@ -76,8 +76,8 @@ TEST(FFSVolumeTest, ReadParityFfsDc) {
 }
 
 TEST(FFSVolumeTest, ReadParityRdb) {
-    if (!std::filesystem::exists("../../tests/data/rdb-amidisk.hdf")) GTEST_SKIP() << "rdb-amidisk.hdf missing";
-    auto img = DiskImage::open("../../tests/data/rdb-amidisk.hdf");
+    if (!std::filesystem::exists("../../amidisk_python/tests/data/rdb-amidisk.hdf")) GTEST_SKIP() << "rdb-amidisk.hdf missing";
+    auto img = DiskImage::open("../../amidisk_python/tests/data/rdb-amidisk.hdf");
     ASSERT_NE(img, nullptr);
 
     auto vol_ref = img->get_volume("DH0");

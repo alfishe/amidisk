@@ -14,7 +14,7 @@ protected:
     Volume* vol = nullptr;
 
     void SetUp() override {
-        std::vector<std::string> paths = {"../../../tests/data", "../../../data"};
+        std::vector<std::string> paths = {"../../../amidisk_python/tests/data", "../../../data"};
         for (const auto& p : paths) {
             std::string path = p + "/sfs-real.hdf";
             if (std::filesystem::exists(path)) {

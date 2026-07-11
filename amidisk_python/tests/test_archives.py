@@ -7,7 +7,9 @@ SCRATCH_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scratch
 import tempfile
 from datetime import datetime
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.join(os.path.dirname(TEST_DIR), "src")
+REPO_ROOT = os.path.dirname(os.path.dirname(TEST_DIR))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
@@ -18,8 +20,8 @@ from amidisk.archives.base import find_executable
 from amidisk.blkdev import ImageFileBlkDev
 from amidisk.fs.ffs import FFSVolume
 
-REAL_LHA = os.path.join(ROOT, "tests", "data", "pfs3aio.lha")
-REAL_7Z = os.path.join(ROOT, "test.7z")
+REAL_LHA = os.path.join(TEST_DIR, "data", "pfs3aio.lha")
+REAL_7Z = os.path.join(REPO_ROOT, "test.7z")
 
 class TestSubprocessArchives(unittest.TestCase):
     def setUp(self):

@@ -164,6 +164,7 @@ $RECYCLE.BIN/
 *.swo
 .claude/
 .gemini/
+.qoder/
 .vs/
 
 # ==============================================================================
@@ -174,12 +175,7 @@ $RECYCLE.BIN/
 # Large disk images
 *.hdf
 *.vhd
-
 *.tar
-tests/scratch/
 
-# IDE/tool configs
-.qoder/
-
-# Host test data (ROMs, WHDLoad sources, etc.)
+# Host test data
 data/host/

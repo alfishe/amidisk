@@ -2,7 +2,8 @@ import unittest
 import os
 import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.join(os.path.dirname(TEST_DIR), "src")
 sys.path.insert(0, ROOT)
 
 from amidisk.blkdev import BlockDevice

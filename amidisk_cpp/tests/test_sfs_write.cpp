@@ -37,7 +37,7 @@ TEST_F(SFSWriteTest, FormatBinaryParity) {
     create_empty_file("data_tmp/sfs_py.img", sz);
     create_empty_file("data_tmp/sfs_cpp.img", sz);
 
-    std::string py_cmd = "PYTHONPATH=.. python3 -m amidisk format --dostype 0x53465300 data_tmp/sfs_py.img Empty";
+    std::string py_cmd = "PYTHONPATH=../../../amidisk_python/src:../../amidisk_python/src:../amidisk_python/src:amidisk_python/src python3 -m amidisk format --dostype 0x53465300 data_tmp/sfs_py.img Empty";
     int ret = std::system(py_cmd.c_str());
     EXPECT_EQ(ret, 0);
 

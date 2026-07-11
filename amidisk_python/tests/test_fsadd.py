@@ -10,14 +10,16 @@ import unittest
 
 SCRATCH_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scratch")
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.join(os.path.dirname(TEST_DIR), "src")
+REPO_ROOT = os.path.dirname(os.path.dirname(TEST_DIR))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from amidisk.blkdev import ImageFileBlkDev      # noqa: E402
 from amidisk.rdb import RDisk, RDiskError       # noqa: E402
 
-DRIVERS = os.path.join(ROOT, "data", "drivers")
+DRIVERS = os.path.join(REPO_ROOT, "data", "drivers")
 PFS3AIO = os.path.join(DRIVERS, "pfs3aio")
 
 

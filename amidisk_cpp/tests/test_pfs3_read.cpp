@@ -13,10 +13,10 @@ protected:
     Volume* vol = nullptr;
 
     void SetUp() override {
-        if (!fs::exists("../../../tests/data/pfs3-real.hdf")) {
+        if (!fs::exists("../../../amidisk_python/tests/data/pfs3-real.hdf")) {
             GTEST_SKIP() << "pfs3-real.hdf missing";
         }
-        img = DiskImage::open("../../../tests/data/pfs3-real.hdf");
+        img = DiskImage::open("../../../amidisk_python/tests/data/pfs3-real.hdf");
         ASSERT_NE(img, nullptr);
         ASSERT_FALSE(img->volumes().empty());
         vol = img->volumes()[0]->mount();
@@ -86,10 +86,10 @@ TEST_F(TestMountReal, ReadOnlyGuard) {
 }
 
 TEST(TestMountHst, HstVolume) {
-    if (!fs::exists("../../../tests/data/pfs3-hst.hdf")) {
+    if (!fs::exists("../../../amidisk_python/tests/data/pfs3-hst.hdf")) {
         GTEST_SKIP() << "pfs3-hst.hdf missing";
     }
-    auto img = DiskImage::open("../../../tests/data/pfs3-hst.hdf");
+    auto img = DiskImage::open("../../../amidisk_python/tests/data/pfs3-hst.hdf");
     ASSERT_NE(img, nullptr);
     auto vol_ref = img->get_volume("DH0");
     ASSERT_NE(vol_ref, nullptr);

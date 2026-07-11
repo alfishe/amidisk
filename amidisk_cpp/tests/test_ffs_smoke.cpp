@@ -8,7 +8,7 @@ using namespace amidisk;
 namespace fs = std::filesystem;
 
 TEST(FFSVolumeTest, SmokeCheckAllFixtures) {
-    std::vector<std::string> paths = {"../../../tests/data", "../../../data"};
+    std::vector<std::string> paths = {"../../../amidisk_python/tests/data", "../../../data"};
     for (const auto& base_path : paths) {
         if (!fs::exists(base_path)) continue;
         for (const auto& entry : fs::directory_iterator(base_path)) {
