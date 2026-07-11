@@ -201,7 +201,7 @@ void cmd_create(const std::string& image_path, const std::string& size_str, cons
 
         if (!format_label.empty()) {
             auto img = DiskImage::open(image_path, false);
-            auto vol_ref = img->get_volume("DH0");
+            auto vol_ref = img->get_volume("");  // auto-detect sole volume
             if (vol_ref) {
                 auto bdev = vol_ref->create_blkdev();
                 uint32_t dos_type = 0x444F5307;
@@ -1050,8 +1050,8 @@ int main(int argc, char** argv) {
     // Ls command
     auto ls = app.add_subcommand("ls", "List directory contents");
     ls->add_option("image", image_path, "Path to the disk image")->required();
-    std::string volume_name = "DH0";
-    ls->add_option("-v,--volume", volume_name, "Volume name (default: DH0)");
+    std::string volume_name;
+    ls->add_option("-v,--volume", volume_name, "Volume name (auto-detected for single-volume images)");
     std::string path = "/";
     ls->add_option("path", path, "Directory path to list");
     bool long_format = false;
@@ -1064,19 +1064,21 @@ int main(int argc, char** argv) {
 
     // Cat command
     auto cat = app.add_subcommand("cat", "Print file contents to stdout");
-    cat->add_option("image", image_path, "Path to the disk image")->required();
-    cat->add_option("-v,--volume", volume_name, "Volume name (default: DH0)");
-    cat->add_option("path", path, "File path to read")->required();
+    cat->add_option("image", image_path, "Path to the disk image (e.g. disk.adf:DF0/path)")->required();
+    cat->add_option("-v,--volume", volume_name, "Volume name (auto-detected for single-volume images)");
     cat->callback([&]() {
         auto parsed = parse_image_arg(image_path, volume_name);
-        std::string cat_path = parsed.path.empty() ? path : parsed.path;
-        cmd_cat(parsed.image, parsed.vol, cat_path);
+        if (parsed.path.empty()) {
+            std::cerr << "Error: file path required (use image:VOL/path syntax)" << std::endl;
+            return;
+        }
+        cmd_cat(parsed.image, parsed.vol, parsed.path);
     });
 
     // Check command
     auto check_cmd = app.add_subcommand("check", "Validate filesystem consistency");
     check_cmd->add_option("image", image_path, "Path to the disk image")->required();
-    check_cmd->add_option("-v,--volume", volume_name, "Volume name (default: DH0)");
+    check_cmd->add_option("-v,--volume", volume_name, "Volume name (auto-detected for single-volume images)");
     bool deep = false;
     check_cmd->add_flag("--deep", deep, "Deep OFS verification");
     check_cmd->callback([&]() {
@@ -1090,17 +1092,20 @@ int main(int argc, char** argv) {
     std::string create_size = "10M";
     std::string create_format_label;
     std::string create_dostype;
+    bool create_adf = false;
     create_cmd->add_option("--size", create_size, "Image size (e.g. 100M, 1G)");
     create_cmd->add_option("--format", create_format_label, "Format after creating with this label");
     create_cmd->add_option("--dostype", create_dostype, "DOS type (ofs|ffs|ofs-intl|ffs-intl|ffs-intl-lnfs|dos7)");
+    create_cmd->add_flag("--adf", create_adf, "Create 880K ADF floppy image");
     create_cmd->callback([&]() {
+        if (create_adf) create_size = "880K";
         cmd_create(image_path, create_size, create_format_label, create_dostype);
     });
     
     // Format command
     auto format_cmd = app.add_subcommand("format", "Format a volume");
     format_cmd->add_option("image", image_path, "Path to the disk image")->required();
-    format_cmd->add_option("-v,--volume", volume_name, "Volume name (default: DH0)");
+    format_cmd->add_option("-v,--volume", volume_name, "Volume name (auto-detected for single-volume images)");
     std::string label;
     format_cmd->add_option("label", label, "Volume label")->required();
     std::string dostype_str;
@@ -1113,7 +1118,7 @@ int main(int argc, char** argv) {
     // Extract command (image → host)
     auto extract_cmd = app.add_subcommand("extract", "Extract files from volume to host");
     extract_cmd->add_option("image", image_path, "Path to the disk image (e.g. disk.hdf:DH0/path)")->required();
-    extract_cmd->add_option("-v,--volume", volume_name, "Volume name (default: DH0)");
+    extract_cmd->add_option("-v,--volume", volume_name, "Volume name (auto-detected for single-volume images)");
     std::string extract_dest = ".";
     extract_cmd->add_option("dest", extract_dest, "Destination path on host");
     bool extract_recursive = false;
@@ -1124,13 +1129,13 @@ int main(int argc, char** argv) {
     });
 
     // Put command (host → image)
+    // Supports both: put src image:VOL/path  AND  put image src dest
     auto put_cmd = app.add_subcommand("put", "Copy files from host to volume");
-    put_cmd->add_option("image", image_path, "Path to the disk image")->required();
-    put_cmd->add_option("-v,--volume", volume_name, "Volume name (default: DH0)");
-    std::string put_src;
-    put_cmd->add_option("src", put_src, "Source file/directory on host")->required();
-    std::string put_dest = "";
-    put_cmd->add_option("dest", put_dest, "Destination path on volume");
+    std::string put_arg1, put_arg2, put_arg3;
+    put_cmd->add_option("arg1", put_arg1, "Source file OR disk image")->required();
+    put_cmd->add_option("arg2", put_arg2, "Disk image:path OR source file")->required();
+    put_cmd->add_option("arg3", put_arg3, "Destination path (optional)");
+    put_cmd->add_option("-v,--volume", volume_name, "Volume name (auto-detected for single-volume images)");
     bool put_recursive = false;
     put_cmd->add_flag("-r,--recursive", put_recursive, "Recursively copy directories");
     bool put_bulk = false;
@@ -1140,10 +1145,25 @@ int main(int argc, char** argv) {
     std::string put_comment;
     put_cmd->add_option("--comment", put_comment, "File comment");
     put_cmd->callback([&]() {
-        auto parsed = parse_image_arg(image_path, volume_name);
-        std::string dest = parsed.path.empty() ? put_dest : parsed.path;
+        std::string img_path, src_path, dest_path;
+        // Detect SCP-style: put src image:path
+        auto parsed2 = parse_image_arg(put_arg2, volume_name);
+        if (!parsed2.vol.empty() || std::filesystem::exists(parsed2.image)) {
+            // arg2 looks like an image path
+            src_path = put_arg1;
+            img_path = parsed2.image;
+            dest_path = parsed2.path.empty() ? put_arg3 : parsed2.path;
+            volume_name = parsed2.vol;
+        } else {
+            // Traditional: put image src dest
+            auto parsed1 = parse_image_arg(put_arg1, volume_name);
+            img_path = parsed1.image;
+            volume_name = parsed1.vol;
+            src_path = put_arg2;
+            dest_path = parsed1.path.empty() ? put_arg3 : parsed1.path;
+        }
         uint32_t protect = put_protect.empty() ? 0 : str_to_protect(put_protect);
-        cmd_put(parsed.image, parsed.vol, put_src, dest, put_recursive, put_bulk, protect, put_comment);
+        cmd_put(img_path, volume_name, src_path, dest_path, put_recursive, put_bulk, protect, put_comment);
     });
 
     // Cp command (Archive extraction or file copy)
@@ -1164,36 +1184,36 @@ int main(int argc, char** argv) {
 
     // mkdir
     auto mkdir = app.add_subcommand("mkdir", "Create a directory");
-    mkdir->add_option("image", image_path, "Path to disk image")->required();
+    mkdir->add_option("image", image_path, "Path to disk image (e.g. disk.adf:DF0/path)")->required();
     mkdir->add_option("-v,--volume", volume_name, "Volume name");
-    mkdir->add_option("path", path, "Directory path")->required();
     bool parents = false;
     mkdir->add_flag("-p,--parents", parents, "Create parent directories as needed");
     mkdir->callback([&]() {
         try {
-            auto img = DiskImage::open(image_path, false);
-            auto vol_ref = img->get_volume(volume_name);
+            auto parsed = parse_image_arg(image_path, volume_name);
+            auto img = DiskImage::open(parsed.image, false);
+            auto vol_ref = img->get_volume(parsed.vol);
             if (!vol_ref) { std::cerr << "Volume not found\n"; return; }
-            if (parents) vol_ref->mount()->makedirs(path);
-            else vol_ref->mount()->mkdir(path);
-            std::cout << "Created " << path << std::endl;
+            if (parents) vol_ref->mount()->makedirs(parsed.path);
+            else vol_ref->mount()->mkdir(parsed.path);
+            std::cout << "created " << image_path << std::endl;
         } catch (const std::exception& e) { std::cerr << "Error: " << e.what() << "\n"; }
     });
 
     // rm
     auto rm = app.add_subcommand("rm", "Remove a file or directory");
-    rm->add_option("image", image_path, "Path to disk image")->required();
+    rm->add_option("image", image_path, "Path to disk image (e.g. disk.adf:DF0/path)")->required();
     rm->add_option("-v,--volume", volume_name, "Volume name");
-    rm->add_option("path", path, "File or directory path")->required();
     bool recursive = false;
     rm->add_flag("-r,--recursive", recursive, "Remove directories and their contents recursively");
     rm->callback([&]() {
         try {
-            auto img = DiskImage::open(image_path, false);
-            auto vol_ref = img->get_volume(volume_name);
+            auto parsed = parse_image_arg(image_path, volume_name);
+            auto img = DiskImage::open(parsed.image, false);
+            auto vol_ref = img->get_volume(parsed.vol);
             if (!vol_ref) { std::cerr << "Volume not found\n"; return; }
-            vol_ref->mount()->delete_path(path, recursive);
-            std::cout << "Deleted " << path << std::endl;
+            vol_ref->mount()->delete_path(parsed.path, recursive);
+            std::cout << "Deleted " << parsed.path << std::endl;
         } catch (const std::exception& e) { std::cerr << "Error: " << e.what() << "\n"; }
     });
 
@@ -1311,7 +1331,7 @@ int main(int argc, char** argv) {
     // bootblock
     auto bb_cmd = app.add_subcommand("bootblock", "Install bootblock to partition");
     bb_cmd->add_option("image", image_path, "Path to disk image")->required();
-    bb_cmd->add_option("-v,--volume", volume_name, "Volume name (default: DH0)");
+    bb_cmd->add_option("-v,--volume", volume_name, "Volume name (auto-detected for single-volume images)");
     std::string bb_path;
     bb_cmd->add_option("bootcode", bb_path, "Path to bootcode binary")->required();
     bb_cmd->callback([&]() {

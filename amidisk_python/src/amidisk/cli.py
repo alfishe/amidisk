@@ -102,8 +102,13 @@ def _combine_path(vol_name, path):
             v, p = vol_name.split("/", 1)
             return v + ":" + p
         return vol_name + ":" if vol_name else ""
-    if ":" not in path and vol_name:
-        return vol_name + ":" + path
+    if ":" not in path:
+        if vol_name:
+            return vol_name + ":" + path
+        # No vol_name provided, check if path looks like VOL/subpath
+        if "/" in path:
+            v, p = path.split("/", 1)
+            return v + ":" + p
     return path
 
 
