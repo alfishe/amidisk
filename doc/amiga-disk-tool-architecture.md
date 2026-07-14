@@ -1,6 +1,7 @@
 # AmigaDisk Toolkit — Architecture Document
 
 **Status:** Draft v0.1
+
 **Scope:** Cross-platform tool and library for reliable read/write access to Amiga HDF images and directly-attached physical disks, with full RDB (Rigid Disk Block) partition management and support for all mainstream Amiga filesystems (OFS, FFS, PFS3, SFS) on modern host operating systems (Windows, macOS, Linux).
 
 ---

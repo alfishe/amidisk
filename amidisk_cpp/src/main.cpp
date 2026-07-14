@@ -1238,11 +1238,11 @@ int main(int argc, char** argv) {
     auto repair = app.add_subcommand("repair", "Repair filesystem allocation bitmap");
     repair->add_option("image", image_path, "Path to disk image")->required();
     repair->add_option("-v,--volume", volume_name, "Volume name");
-    bool apply = false;
-    repair->add_flag("--apply", apply, "Apply fixes to disk");
+    bool repair_write = false;
+    repair->add_flag("--write", repair_write, "Apply fixes to disk (default: dry run)");
     repair->callback([&]() {
         try {
-            auto img = DiskImage::open(image_path, !apply);
+            auto img = DiskImage::open(image_path, !repair_write);
             std::vector<VolumeRef*> vols;
             if (volume_name.empty()) {
                 for (auto& v : img->volumes()) vols.push_back(v.get());
@@ -1254,8 +1254,12 @@ int main(int argc, char** argv) {
                 if (!vol_ref) continue;
                 std::cout << "Repairing " << vol_ref->name() << "..." << std::endl;
                 try {
-                    uint32_t fixes = vol_ref->mount()->repair(apply);
-                    std::cout << "  " << fixes << " fixes applied" << std::endl;
+                    uint32_t fixes = vol_ref->mount()->repair(repair_write);
+                    if (!repair_write) {
+                        std::cout << "  " << fixes << " fixes would be applied (dry run). Use --write to commit." << std::endl;
+                    } else {
+                        std::cout << "  " << fixes << " fixes applied" << std::endl;
+                    }
                 } catch (const std::exception& e) {
                     std::cerr << "  error: " << e.what() << std::endl;
                 }
@@ -1295,11 +1299,29 @@ int main(int argc, char** argv) {
     });
 
     // part-del
-    auto part_del = app.add_subcommand("part-del", "Delete a partition from RDB");
+    auto part_del = app.add_subcommand("part-del", "Delete a partition from RDB (simulates first)");
     part_del->add_option("image", image_path, "Path to disk image")->required();
     part_del->add_option("name", drv_name, "Drive name (e.g. DH0)")->required();
+    bool part_del_write = false;
+    part_del->add_flag("--write", part_del_write, "Apply deletion to disk (default: dry run)");
     part_del->callback([&]() {
         auto parsed = parse_image_arg(image_path);
+        if (!part_del_write) {
+            std::cout << "Would delete partition " << drv_name << ". Use --write to apply." << std::endl;
+            // Still open read-only to show the partition exists
+            try {
+                auto img = DiskImage::open(parsed.image, true);
+                if (img->rdisk()) {
+                    for (const auto& part : img->rdisk()->partitions()) {
+                        if (part->drv_name() == drv_name) {
+                            std::cout << "  " << drv_name << "  " << part->get_dos_type_str()
+                                      << "  " << human_size(part->get_byte_size()) << std::endl;
+                        }
+                    }
+                }
+            } catch (...) {}
+            return;
+        }
         cmd_part_del(parsed.image, drv_name);
     });
 
@@ -1353,11 +1375,11 @@ int main(int argc, char** argv) {
     auto rebuild_cmd = app.add_subcommand("rdb-rebuild", "Rebuild missing RDB from scanned partitions");
     rebuild_cmd->add_option("image", image_path, "Path to disk image")->required();
     rebuild_cmd->add_option("output", out_path, "Path to write modified image (if empty, modifies in place)");
-    bool dry_run = false;
-    rebuild_cmd->add_flag("--dry-run", dry_run, "Simulate the rebuild using a memory overlay without writing to disk");
+    bool rebuild_write = false;
+    rebuild_cmd->add_flag("--write", rebuild_write, "Apply changes to disk (default: dry run)");
     rebuild_cmd->callback([&]() {
         auto parsed = parse_image_arg(image_path);
-        cmd_rdb_rebuild(parsed.image, out_path, dry_run);
+        cmd_rdb_rebuild(parsed.image, out_path, !rebuild_write);
     });
 
     if (argc == 1) {
