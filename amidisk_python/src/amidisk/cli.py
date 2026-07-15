@@ -821,23 +821,40 @@ def cmd_bootblock(args):
         vol_ref = img.get_volume(vol_name)
         
         with open(args.bootcode, "rb") as f:
-            bootcode = f.read()
+            payload = f.read()
             
         vol = vol_ref.raw_volume()
             
-        # Standard Amiga bootblock is 2 blocks (1024 bytes for 512b sectors)
+        # Standard Amiga bootblock is 2 blocks (1024 bytes for 512-byte sectors)
         bb_size = vol.dev.block_bytes * 2
-        if len(bootcode) > bb_size:
-            print("error: bootcode is too large (%d > %d bytes)" % (len(bootcode), bb_size), file=sys.stderr)
+        if len(payload) > bb_size - 12:
+            print("error: bootcode payload too large (%d > %d bytes)" % (len(payload), bb_size - 12), file=sys.stderr)
             return 1
             
-        # Pad with zeros
-        padded = bootcode.ljust(bb_size, b'\x00')
+        # Build bootblock: signature(4) + checksum(4) + root(4) + payload + pad
+        import struct
+        dos_type = vol_ref.partition.dos_env.dos_type if vol_ref.partition else 0x444F5303
+        bb = bytearray(bb_size)
+        struct.pack_into(">I", bb, 0, dos_type)     # signature
+        struct.pack_into(">I", bb, 4, 0)               # checksum placeholder
+        struct.pack_into(">I", bb, 8, 0)               # root block pointer
+        bb[12:12 + len(payload)] = payload
+            
+        # Compute checksum: sum all longwords except offset 4, with carry wrapping
+        acc = 0
+        for i in range(0, bb_size, 4):
+            if i == 4:
+                continue
+            acc += struct.unpack_from(">I", bb, i)[0]
+            if acc > 0xFFFFFFFF:
+                acc = (acc & 0xFFFFFFFF) + 1
+        checksum = (~acc) & 0xFFFFFFFF
+        struct.pack_into(">I", bb, 4, checksum)
         
-        # Check if the partition already has a DOS type, if the bootcode lacks DOS\x we might warn.
-        vol.dev.write(0, padded)
+        vol.dev.write(0, bytes(bb))
         
-        print("installed bootblock (%d bytes) to %s" % (len(bootcode), vol_ref.name))
+        print("installed bootblock (%d bytes, checksum 0x%08X) to %s" % (
+            len(payload), checksum, vol_ref.name))
     return 0
 
 

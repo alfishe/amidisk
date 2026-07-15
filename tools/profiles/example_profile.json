@@ -1,0 +1,33 @@
+{
+  "name": "AmigaOS 3.2.3",
+  "description": "Clean OS install from ADF set + tar archive",
+
+  "disk": {
+    "size": "2G",
+    "heads": 16,
+    "sectors": 63
+  },
+
+  "partition": {
+    "name": "DH0",
+    "dostype": "ffs-intl",
+    "block_size": 4096,
+    "bootable": true,
+    "label": "System",
+    "size": "*"
+  },
+
+  "sources": [
+    "Install-Workbench.adf",
+    "Extras.adf",
+    "os_content.tar"
+  ],
+
+  "exclusions": [
+    "**/.info",
+    "Install/**"
+  ],
+
+  "bootblock": "2x3x",
+  "filesystem_driver": "auto"
+}

@@ -1,0 +1,34 @@
+{
+  "name": "AmigaOS 3.1.4 — Full Install to DH0",
+  "description": "All 7 ADFs merged to DH0: Workbench+Fonts+Locale+Install+Extras+Storage+Modules",
+
+  "disk": {
+    "size": "4G",
+    "heads": 16,
+    "sectors": 63
+  },
+
+  "partition": {
+    "name": "DH0",
+    "dostype": "ffs-intl",
+    "block_size": 4096,
+    "bootable": true,
+    "label": "System",
+    "size": "*"
+  },
+
+  "sources": [
+    "../../data/host/OS/3,1,4/Workbench3_1_4.adf",
+    "../../data/host/OS/3,1,4/Fonts.adf",
+    "../../data/host/OS/3,1,4/Locale.adf",
+    "../../data/host/OS/3,1,4/Install3_1_4.adf",
+    "../../data/host/OS/3,1,4/Extras3_1_4.adf",
+    "../../data/host/OS/3,1,4/Storage3_1_4.adf",
+    "../../data/host/OS/3,1,4/ModulesA4000D_3.1.4.adf"
+  ],
+
+  "exclusions": [],
+
+  "bootblock": null,
+  "filesystem_driver": null
+}

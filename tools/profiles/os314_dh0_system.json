@@ -1,0 +1,37 @@
+{
+  "name": "AmigaOS 3.1.4 — System (DH0)",
+  "description": "Core OS: Workbench + Fonts + Locale + Install merged to DH0",
+
+  "disk": {
+    "size": "4G",
+    "heads": 16,
+    "sectors": 63
+  },
+
+  "partition": {
+    "name": "DH0",
+    "dostype": "ffs-intl",
+    "block_size": 4096,
+    "bootable": true,
+    "label": "System",
+    "size": "*"
+  },
+
+  "sources": [
+    "../../data/host/OS/3,1,4/Workbench3_1_4.adf",
+    "../../data/host/OS/3,1,4/Fonts.adf",
+    "../../data/host/OS/3,1,4/Locale.adf",
+    "../../data/host/OS/3,1,4/Install3_1_4.adf"
+  ],
+
+  "exclusions": [
+    "Installer",
+    "HDSetup",
+    "HDTools",
+    "Install",
+    "Update"
+  ],
+
+  "bootblock": "2x3x",
+  "filesystem_driver": "auto"
+}

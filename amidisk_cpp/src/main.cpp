@@ -102,21 +102,35 @@ void cmd_info(const std::string& image_path, const std::string& vol_name) {
                 if (v_ref->partition()) {
                     auto info = v_ref->partition()->get_info();
                     try {
-                        std::vector<uint8_t> boot(1024);
-                        img->blkdev()->read(v_ref->partition()->get_byte_offset(), boot);
-                        uint32_t sum = 0;
+                        // Read raw bootblock (1024 bytes)
+                        uint64_t part_offset = v_ref->partition()->get_byte_offset();
+                        uint32_t bs = v_ref->partition()->get_block_size();
+                        // Always read at least 1024 bytes, but round up to block boundary
+                        uint32_t read_size = std::max<uint32_t>(1024, bs);
+                        read_size = ((read_size + bs - 1) / bs) * bs;
+                        std::vector<uint8_t> raw_boot(read_size);
+                        img->blkdev()->read(part_offset, raw_boot);
+                        // Checksum is always computed over first 1024 bytes (256 longwords)
+                        std::vector<uint8_t>& boot = raw_boot;
+                        uint64_t acc = 0;
                         for (int i = 0; i < 256; ++i) {
-                            sum += (boot[i*4]<<24) | (boot[i*4+1]<<16) | (boot[i*4+2]<<8) | boot[i*4+3];
+                            if (i == 1) continue;  // skip checksum field at offset 4
+                            uint32_t val = (uint32_t(boot[i*4]) << 24) | (uint32_t(boot[i*4+1]) << 16)
+                                         | (uint32_t(boot[i*4+2]) << 8) | uint32_t(boot[i*4+3]);
+                            acc += val;
+                            if (acc > 0xFFFFFFFFULL)
+                                acc = (acc & 0xFFFFFFFFULL) + 1ULL;
                         }
-                        sum = (~sum + 1) & 0xFFFFFFFF;
-                        uint32_t got = (boot[4]<<24) | (boot[5]<<16) | (boot[6]<<8) | boot[7];
-                        if (sum == got && got != 0) {
+                        uint32_t expected = uint32_t(~acc & 0xFFFFFFFFULL);
+                        uint32_t got = (uint32_t(boot[4]) << 24) | (uint32_t(boot[5]) << 16)
+                                     | (uint32_t(boot[6]) << 8) | uint32_t(boot[7]);
+                        if (expected == got && got != 0) {
                             std::cout << "  bootblock:  Custom Executable (chksum OK: 0x" << std::hex << std::setw(8) << std::setfill('0') << got << std::dec << ")\n";
                         } else if (got == 0) {
                             std::cout << "  bootblock:  Standard (ID: " << v_ref->partition()->get_dos_type_str() << ", no custom bootcode)\n";
                         } else {
-                            std::cout << "  bootblock:  INVALID CHECKSUM (ID: " << v_ref->partition()->get_dos_type_str() << ", got: 0x" 
-                                      << std::hex << std::setw(8) << std::setfill('0') << got << ", exp: 0x" << sum << std::dec << ")\n";
+                            std::cout << "  bootblock:  INVALID CHECKSUM (ID: " << v_ref->partition()->get_dos_type_str() << ", got: 0x"
+                                      << std::hex << std::setw(8) << std::setfill('0') << got << ", exp: 0x" << expected << std::dec << ")\n";
                         }
                     } catch (...) {}
                 }
@@ -951,19 +965,49 @@ void cmd_bootblock(const std::string& image_path, const std::string& volume_name
         
         std::ifstream file(bb_path, std::ios::binary);
         if (!file) throw std::runtime_error("Cannot open bootblock file: " + bb_path);
-        std::vector<uint8_t> bb_data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        std::vector<uint8_t> payload((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
         
         auto bdev = vol_ref->create_blkdev();
         uint32_t bb_size = bdev->sector_size() * 2; // 2 blocks
-        if (bb_data.size() > bb_size) {
-            std::cerr << "Error: bootcode is too large (" << bb_data.size() << " > " << bb_size << " bytes)" << std::endl;
+        if (payload.size() > bb_size - 12) {
+            std::cerr << "Error: bootcode payload too large (" << payload.size() << " > " << (bb_size - 12) << " bytes)" << std::endl;
             return;
         }
         
-        bb_data.resize(bb_size, 0); // pad with zeros
-        bdev->write(0, bb_data); // write to block 0 (and 1) of the partition
+        // Build bootblock: signature(4) + checksum(4) + root(4) + payload + pad
+        std::vector<uint8_t> bb(bb_size, 0);
+        uint32_t dos_type = vol_ref->partition()->dos_env().dos_type;
+        bb[0] = (dos_type >> 24) & 0xFF;
+        bb[1] = (dos_type >> 16) & 0xFF;
+        bb[2] = (dos_type >> 8) & 0xFF;
+        bb[3] = dos_type & 0xFF;
+        // checksum at offset 4: zero placeholder
+        // root block pointer at offset 8: zero (set by filesystem)
+        // payload at offset 12
+        memcpy(bb.data() + 12, payload.data(), payload.size());
         
-        std::cout << "Installed bootblock (" << bb_data.size() << " bytes) to " << vol_ref->name() << std::endl;
+        // Compute checksum: sum all longwords except offset 4, with carry wrapping
+        uint64_t acc = 0;
+        int n_longs = bb_size / 4;
+        for (int i = 0; i < n_longs; ++i) {
+            if (i == 1) continue;  // skip checksum field
+            uint32_t val = (uint32_t(bb[i*4]) << 24) | (uint32_t(bb[i*4+1]) << 16)
+                         | (uint32_t(bb[i*4+2]) << 8) | uint32_t(bb[i*4+3]);
+            acc += val;
+            if (acc > 0xFFFFFFFFULL)
+                acc = (acc & 0xFFFFFFFFULL) + 1ULL;
+        }
+        uint32_t checksum = uint32_t(~acc & 0xFFFFFFFFULL);
+        bb[4] = (checksum >> 24) & 0xFF;
+        bb[5] = (checksum >> 16) & 0xFF;
+        bb[6] = (checksum >> 8) & 0xFF;
+        bb[7] = checksum & 0xFF;
+        
+        bdev->write(0, bb);
+        
+        std::cout << "Installed bootblock (" << payload.size() << " bytes, checksum 0x"
+                  << std::hex << std::setw(8) << std::setfill('0') << checksum << std::dec
+                  << ") to " << vol_ref->name() << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
     }
